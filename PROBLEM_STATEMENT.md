@@ -8,6 +8,10 @@ User is on Windows, and wants to record multiple audio streams from different de
 
 Not decided yet.
 
+# Build system
+
+Not decided yet.
+
 # Build environment
 
 Prioritize being able to build from here (devcontainer).
@@ -53,3 +57,7 @@ As an example, if one audio device fails, the others should continue to record.
 ## Performance
 
 Low RAM usage will help with reliability.
+
+# Testing / GitHub CI
+
+Generally good development practice. Some overhead, but worth it for code quality.
