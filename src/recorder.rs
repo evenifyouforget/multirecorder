@@ -258,7 +258,7 @@ impl RawWriter {
     }
 
     fn write_silence(&mut self, frames: u64) -> std::io::Result<()> {
-        const CHUNK: [u8; 64 * 1024] = [0; 64 * 1024];
+        static CHUNK: [u8; 64 * 1024] = [0; 64 * 1024];
         let mut bytes = frames * self.channels as u64 * 4;
         while bytes > 0 {
             let n = bytes.min(CHUNK.len() as u64) as usize;

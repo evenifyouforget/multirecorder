@@ -152,8 +152,8 @@ fn for_each_chunk(
         let n = remaining.min(CHUNK_FRAMES as u64) as usize;
         let buf = &mut bytes[..n * channels * 4];
         reader.read_exact(buf)?;
-        for (s, b) in samples.iter_mut().zip(buf.chunks_exact(4)) {
-            *s = f32::from_le_bytes([b[0], b[1], b[2], b[3]]);
+        for (s, b) in samples.iter_mut().zip(buf.as_chunks::<4>().0) {
+            *s = f32::from_le_bytes(*b);
         }
         f(&samples[..n * channels])?;
         remaining -= n as u64;
