@@ -18,6 +18,8 @@ enum Mode {
     Stalled,
     /// Device unplugged: running streams die, opening fails.
     Gone,
+    /// Broken driver delivering audio far faster than real time.
+    Flood,
 }
 
 #[derive(Clone)]
@@ -79,6 +81,13 @@ impl InputSource for FakeSource {
                 match control.get() {
                     Mode::Ok => {
                         let frames = (due - sent) as usize;
+                        sink.push(
+                            &vec![value; frames * usize::from(channels)],
+                            usize::from(channels),
+                        );
+                    }
+                    Mode::Flood => {
+                        let frames = 50 * (due - sent) as usize;
                         sink.push(
                             &vec![value; frames * usize::from(channels)],
                             usize::from(channels),
@@ -351,4 +360,38 @@ fn data_on_disk_while_recording_is_recoverable() {
     assert!(std::fs::metadata(&outs[0]).unwrap().len() > 0);
 
     rec.stop(Duration::from_secs(5)).unwrap();
+}
+
+#[test]
+fn runaway_device_cannot_fill_the_disk() {
+    let root = tempfile::tempdir().unwrap();
+    let ok = Control::new(Mode::Ok);
+    let flood = Control::new(Mode::Flood);
+    let config = test_config();
+    let rec = Recorder::start(
+        root.path(),
+        vec![
+            spec("ok", &ok, 48_000, 2, 0.5),
+            spec("flood", &flood, 48_000, 2, 0.5),
+        ],
+        config.clone(),
+    )
+    .unwrap();
+    thread::sleep(Duration::from_millis(1500));
+    let raw = rec.dir().join(&rec.statuses()[1].0.raw_file);
+    let seconds_on_disk = std::fs::metadata(&raw).unwrap().len() as f64 / (2.0 * 4.0 * 48_000.0);
+    let limit = rec.elapsed().as_secs_f64() + config.buffer.as_secs_f64() + 0.1;
+    assert!(
+        seconds_on_disk <= limit,
+        "{seconds_on_disk} s on disk after {:?}",
+        rec.elapsed()
+    );
+    let (dir, meta) = rec.stop(Duration::from_secs(5)).unwrap();
+    let ok_len = std::fs::metadata(dir.join(&meta.tracks[0].raw_file))
+        .unwrap()
+        .len();
+    let flood_len = std::fs::metadata(dir.join(&meta.tracks[1].raw_file))
+        .unwrap()
+        .len();
+    assert_eq!(ok_len, flood_len);
 }

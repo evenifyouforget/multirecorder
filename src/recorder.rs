@@ -351,6 +351,13 @@ impl TrackWorker {
         // While the device is missing, stay slightly behind real time so audio
         // that arrives right after a reconnect is not preceded by too much silence.
         let slack = u64::from(self.sample_rate) / 4;
+        // How far a track may run ahead of the shared timeline (device clock
+        // drift). Anything beyond that is a misbehaving driver and is discarded,
+        // so a device producing audio too fast cannot fill the disk.
+        let max_ahead = (self.config.buffer.as_secs_f64() * f64::from(self.sample_rate)) as u64;
+        let mut overflow_pending = 0u64;
+        let mut discard_pending = 0u64;
+        let mut last_report = Instant::now();
         let mut stream: Option<OpenStream> = None;
         let mut next_attempt = Instant::now();
         let mut last_error = String::new();
@@ -409,19 +416,39 @@ impl TrackWorker {
                 }
             }
 
-            if let Some(s) = stream.as_mut()
-                && drain(&mut s.consumer, &mut self.writer)? > 0
-            {
-                s.last_data = now;
+            let limit = self.timeline_frames(now) + max_ahead;
+            if let Some(s) = stream.as_mut() {
+                let (read, discarded) = drain(&mut s.consumer, &mut self.writer, limit)?;
+                if read > 0 {
+                    s.last_data = now;
+                }
+                discard_pending += discarded;
             }
             let lost = dropped.swap(0, Ordering::Relaxed) / u64::from(self.channels);
             if lost > 0 {
-                self.writer.write_silence(lost)?;
-                silence += lost;
-                self.log.line(&format!(
-                    "{}: buffer overflow, replaced {lost} frames with silence",
-                    self.name
-                ));
+                // Replace lost audio with silence, but never beyond real time.
+                let target = (self.writer.frames() + lost).min(self.timeline_frames(now));
+                silence += self.writer.pad_to(target)?;
+                overflow_pending += lost;
+            }
+            if (overflow_pending > 0 || discard_pending > 0)
+                && now.duration_since(last_report) >= Duration::from_secs(5)
+            {
+                if overflow_pending > 0 {
+                    self.log.line(&format!(
+                        "{}: buffer overflow, {overflow_pending} frames lost (gap filled with silence)",
+                        self.name
+                    ));
+                }
+                if discard_pending > 0 {
+                    self.log.line(&format!(
+                        "{}: device delivers audio faster than real time, discarded {discard_pending} frames",
+                        self.name
+                    ));
+                }
+                overflow_pending = 0;
+                discard_pending = 0;
+                last_report = now;
             }
 
             if let Some(s) = stream.as_mut() {
@@ -440,7 +467,7 @@ impl TrackWorker {
                 if let Some(msg) = failure {
                     let mut dead = stream.take().expect("stream present");
                     drop(dead._stream);
-                    drain(&mut dead.consumer, &mut self.writer)?;
+                    drain(&mut dead.consumer, &mut self.writer, limit)?;
                     self.log.line(&format!("{}: lost device: {msg}", self.name));
                     self.set_state(TrackState::Reconnecting(msg.clone()));
                     last_error = msg;
@@ -457,7 +484,7 @@ impl TrackWorker {
             if let Some(t) = stop_at {
                 if let Some(mut s) = stream.take() {
                     drop(s._stream);
-                    drain(&mut s.consumer, &mut self.writer)?;
+                    drain(&mut s.consumer, &mut self.writer, limit)?;
                 }
                 let end = self.timeline_frames(t);
                 silence += self.writer.pad_to(end)?;
@@ -484,17 +511,25 @@ impl TrackWorker {
     }
 }
 
-/// Moves everything currently in the ring buffer to disk; returns samples moved.
-fn drain(consumer: &mut rtrb::Consumer<f32>, writer: &mut RawWriter) -> std::io::Result<usize> {
+/// Empties the ring buffer, writing to disk until the file holds `max_frames`
+/// and discarding the rest. Returns (samples read, frames discarded).
+fn drain(
+    consumer: &mut rtrb::Consumer<f32>,
+    writer: &mut RawWriter,
+    max_frames: u64,
+) -> std::io::Result<(usize, u64)> {
     let available = consumer.slots();
     let available = available - available % writer.channels;
     if available == 0 {
-        return Ok(0);
+        return Ok((0, 0));
     }
+    let room = max_frames.saturating_sub(writer.frames()) * writer.channels as u64;
+    let keep = available.min(usize::try_from(room).unwrap_or(usize::MAX));
     let chunk = consumer.read_chunk(available).expect("slots checked");
     let (a, b) = chunk.as_slices();
-    writer.write_samples(a)?;
-    writer.write_samples(b)?;
+    let from_a = keep.min(a.len());
+    writer.write_samples(&a[..from_a])?;
+    writer.write_samples(&b[..keep - from_a])?;
     chunk.commit_all();
-    Ok(available)
+    Ok((available, ((available - keep) / writer.channels) as u64))
 }

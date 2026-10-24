@@ -6,11 +6,11 @@ User is on Windows, and wants to record multiple audio streams from different de
 
 # Language/framework
 
-Not decided yet.
+Rust. Audio via cpal (WASAPI on Windows; ASIO deferred past v1), UI via egui/eframe.
 
 # Build system
 
-Not decided yet.
+Cargo. Windows builds from the devcontainer cross-compile with `x86_64-pc-windows-gnu` (mingw-w64).
 
 # Build environment
 

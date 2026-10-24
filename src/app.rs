@@ -390,6 +390,7 @@ impl eframe::App for MultiRecorderApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         egui::CentralPanel::default().show(ui, |ui| {
             egui::ScrollArea::vertical()
+                .id_salt("main")
                 .auto_shrink([false, true])
                 .max_height(ui.available_height() * 0.7)
                 .show(ui, |ui| {
@@ -401,6 +402,7 @@ impl eframe::App for MultiRecorderApp {
             ui.separator();
             ui.strong("Messages");
             egui::ScrollArea::vertical()
+                .id_salt("messages")
                 .stick_to_bottom(true)
                 .auto_shrink([false, false])
                 .show(ui, |ui| {
