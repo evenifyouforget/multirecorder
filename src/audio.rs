@@ -1,0 +1,214 @@
+//! Audio input abstraction plus its cpal implementation.
+//!
+//! The recorder only talks to [`InputSource`], which lets tests drive it with
+//! fake devices that stall, disconnect and reconnect on demand.
+
+use std::any::Any;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::mpsc::Sender;
+
+use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
+use cpal::{DeviceId, ErrorKind, FromSample, SampleFormat, SizedSample, StreamConfig};
+
+/// Event reported by a running stream outside of the data path.
+#[derive(Debug, Clone)]
+pub struct StreamEvent {
+    /// True if the stream is dead and has to be rebuilt.
+    pub fatal: bool,
+    pub message: String,
+}
+
+/// Everything the audio callback needs to hand samples to the recorder.
+pub struct StreamSink {
+    /// Interleaved f32 samples in the track's channel layout.
+    pub producer: rtrb::Producer<f32>,
+    /// Samples that did not fit into the ring buffer. The recorder replaces
+    /// them with silence so the track stays aligned.
+    pub dropped_samples: Arc<AtomicU64>,
+    pub events: Sender<StreamEvent>,
+}
+
+impl StreamSink {
+    /// Pushes one callback's worth of samples. Real-time safe: never blocks or allocates.
+    pub fn push<T>(&mut self, data: &[T], channels: usize)
+    where
+        T: Copy,
+        f32: FromSample<T>,
+    {
+        let fit = data.len().min(self.producer.slots());
+        let fit = fit - fit % channels.max(1);
+        if fit > 0
+            && let Ok(chunk) = self.producer.write_chunk_uninit(fit)
+        {
+            chunk.fill_from_iter(data[..fit].iter().map(|&s| f32::from_sample_(s)));
+        }
+        if fit < data.len() {
+            self.dropped_samples
+                .fetch_add((data.len() - fit) as u64, Ordering::Relaxed);
+        }
+    }
+}
+
+/// A running stream; dropping it stops capture.
+pub type ActiveStream = Box<dyn Any>;
+
+/// A device the recorder can (re)open as often as needed.
+pub trait InputSource: Send {
+    /// Opens and starts the device with the track's sample rate and channel count.
+    fn open(&mut self, sink: StreamSink) -> Result<ActiveStream, String>;
+}
+
+/// An input device as shown in the device list.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct InputDeviceInfo {
+    /// Stable cpal device id (`host:id`), used to find the device again after a reconnect.
+    pub id: String,
+    pub name: String,
+    pub host: String,
+    pub sample_rate: u32,
+    pub channels: u16,
+    pub sample_format: String,
+}
+
+/// Lists input devices of every available audio host.
+pub fn list_input_devices() -> Vec<InputDeviceInfo> {
+    let mut out = Vec::new();
+    for host_id in cpal::available_hosts() {
+        let Ok(host) = cpal::host_from_id(host_id) else {
+            continue;
+        };
+        let Ok(devices) = host.input_devices() else {
+            continue;
+        };
+        for device in devices {
+            let (Ok(id), Ok(config)) = (device.id(), device.default_input_config()) else {
+                continue;
+            };
+            out.push(InputDeviceInfo {
+                id: id.to_string(),
+                name: device.to_string(),
+                host: host_id.name().to_string(),
+                sample_rate: config.sample_rate(),
+                channels: config.channels(),
+                sample_format: config.sample_format().to_string(),
+            });
+        }
+    }
+    out
+}
+
+/// Opens a device by id through cpal, keeping the format chosen at session start.
+pub struct CpalSource {
+    pub device_id: String,
+    pub sample_rate: u32,
+    pub channels: u16,
+}
+
+/// Preferred native sample formats, best first. Everything is converted to f32.
+const FORMAT_PREFERENCE: [SampleFormat; 7] = [
+    SampleFormat::F32,
+    SampleFormat::I32,
+    SampleFormat::I24,
+    SampleFormat::I16,
+    SampleFormat::F64,
+    SampleFormat::U16,
+    SampleFormat::U8,
+];
+
+impl InputSource for CpalSource {
+    fn open(&mut self, sink: StreamSink) -> Result<ActiveStream, String> {
+        let id: DeviceId = self
+            .device_id
+            .parse()
+            .map_err(|e| format!("bad device id: {e:?}"))?;
+        let host = cpal::host_from_id(id.host()).map_err(|e| e.to_string())?;
+        let device = host.device_by_id(&id).ok_or("device not found")?;
+
+        let ranges: Vec<_> = device
+            .supported_input_configs()
+            .map_err(|e| e.to_string())?
+            .filter(|r| r.channels() == self.channels && r.contains_rate(self.sample_rate))
+            .collect();
+        let format = FORMAT_PREFERENCE
+            .into_iter()
+            .find(|f| ranges.iter().any(|r| r.sample_format() == *f))
+            .ok_or_else(|| {
+                format!(
+                    "device no longer supports {} ch @ {} Hz",
+                    self.channels, self.sample_rate
+                )
+            })?;
+
+        let config = StreamConfig {
+            channels: self.channels,
+            sample_rate: self.sample_rate,
+            buffer_size: cpal::BufferSize::Default,
+        };
+        let stream = match format {
+            SampleFormat::F32 => build::<f32>(&device, config, sink),
+            SampleFormat::I32 => build::<i32>(&device, config, sink),
+            SampleFormat::I24 => build::<cpal::I24>(&device, config, sink),
+            SampleFormat::I16 => build::<i16>(&device, config, sink),
+            SampleFormat::F64 => build::<f64>(&device, config, sink),
+            SampleFormat::U16 => build::<u16>(&device, config, sink),
+            SampleFormat::U8 => build::<u8>(&device, config, sink),
+            other => return Err(format!("unsupported sample format {other}")),
+        }
+        .map_err(|e| e.to_string())?;
+        stream.play().map_err(|e| e.to_string())?;
+        Ok(Box::new(stream))
+    }
+}
+
+fn build<T>(
+    device: &cpal::Device,
+    config: StreamConfig,
+    mut sink: StreamSink,
+) -> Result<cpal::Stream, cpal::Error>
+where
+    T: SizedSample + Send + 'static,
+    f32: FromSample<T>,
+{
+    let channels = usize::from(config.channels);
+    let events = sink.events.clone();
+    device.build_input_stream(
+        config,
+        move |data: &[T], _: &cpal::InputCallbackInfo| sink.push(data, channels),
+        move |err: cpal::Error| {
+            let fatal = !matches!(
+                err.kind(),
+                ErrorKind::Xrun | ErrorKind::DeviceChanged | ErrorKind::RealtimeDenied
+            );
+            let _ = events.send(StreamEvent {
+                fatal,
+                message: err.to_string(),
+            });
+        },
+        Some(std::time::Duration::from_secs(5)),
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn push_converts_and_counts_overflow() {
+        let (producer, mut consumer) = rtrb::RingBuffer::new(4);
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let dropped = Arc::new(AtomicU64::new(0));
+        let mut sink = StreamSink {
+            producer,
+            dropped_samples: dropped.clone(),
+            events: tx,
+        };
+
+        sink.push(&[i16::MAX, 0, i16::MIN, 0, 1, 1], 2);
+        // Only whole frames go in; the third frame overflows.
+        assert_eq!(dropped.load(Ordering::Relaxed), 2);
+        let got: Vec<f32> = std::iter::from_fn(|| consumer.pop().ok()).collect();
+        assert_eq!(got.len(), 4);
+        assert!((got[0] - 1.0).abs() < 1e-3 && got[1] == 0.0 && got[2] == -1.0);
+    }
+}
