@@ -20,6 +20,8 @@ enum Mode {
     Gone,
     /// Broken driver delivering audio far faster than real time.
     Flood,
+    /// Glitching driver: a 20 ms gap of digital silence every 200 ms.
+    Choppy,
 }
 
 #[derive(Clone)]
@@ -93,6 +95,17 @@ impl InputSource for FakeSource {
                             usize::from(channels),
                         );
                     }
+                    Mode::Choppy => {
+                        let period = u64::from(rate) / 5;
+                        let gap = u64::from(rate) / 50;
+                        let frames: Vec<f32> = (sent..due)
+                            .flat_map(|f| {
+                                let s = if f % period < gap { 0.0 } else { value };
+                                std::iter::repeat_n(s, usize::from(channels))
+                            })
+                            .collect();
+                        sink.push(&frames, usize::from(channels));
+                    }
                     Mode::Stalled => {}
                     Mode::Gone => {
                         let _ = sink.events.send(StreamEvent {
@@ -118,6 +131,7 @@ fn spec(name: &str, control: &Control, sample_rate: u32, channels: u16, value: f
         device_id: format!("fake:{name}"),
         sample_rate,
         channels,
+        loopback: false,
         source: Box::new(FakeSource {
             control: control.clone(),
             sample_rate,
@@ -134,6 +148,7 @@ fn test_config() -> RecorderConfig {
         retry_interval: Duration::from_millis(100),
         flush_interval: Duration::from_millis(100),
         poll_interval: Duration::from_millis(5),
+        idle_gap: Duration::from_millis(100),
     }
 }
 
@@ -394,4 +409,88 @@ fn runaway_device_cannot_fill_the_disk() {
         .unwrap()
         .len();
     assert_eq!(ok_len, flood_len);
+}
+
+#[test]
+fn choppy_device_raises_warning_and_meters_move() {
+    let root = tempfile::tempdir().unwrap();
+    let ok = Control::new(Mode::Ok);
+    let choppy = Control::new(Mode::Choppy);
+    let rec = Recorder::start(
+        root.path(),
+        vec![
+            spec("ok", &ok, 48_000, 2, 0.5),
+            spec("choppy", &choppy, 48_000, 2, 0.5),
+        ],
+        test_config(),
+    )
+    .unwrap();
+    thread::sleep(Duration::from_millis(1500));
+    let statuses = rec.statuses();
+    let (ok_st, choppy_st) = (&statuses[0].1, &statuses[1].1);
+    assert!(!ok_st.warnings.any_problem(), "{:?}", ok_st.warnings);
+    assert!(ok_st.levels.iter().all(|&l| l > 0.3), "{:?}", ok_st.levels);
+    assert!(choppy_st.warnings.choppy, "{:?}", choppy_st.warnings);
+    assert!(choppy_st.warnings.dropouts >= 4);
+    let (dir, _) = rec.stop(Duration::from_secs(5)).unwrap();
+    let log = std::fs::read_to_string(dir.join(session::LOG_FILE)).unwrap();
+    assert!(log.contains("(choppy): WARNING choppy audio"), "{log}");
+}
+
+#[test]
+fn quiet_loopback_is_padded_not_reconnected() {
+    let root = tempfile::tempdir().unwrap();
+    let ok = Control::new(Mode::Ok);
+    // Windows loopback delivers no data at all while nothing is playing.
+    let speakers = Control::new(Mode::Stalled);
+    let mut loopback = spec("speakers", &speakers, 48_000, 2, 0.5);
+    loopback.loopback = true;
+    let rec = Recorder::start(
+        root.path(),
+        vec![spec("mic", &ok, 48_000, 2, 0.5), loopback],
+        test_config(),
+    )
+    .unwrap();
+
+    thread::sleep(Duration::from_millis(600));
+    let st = rec.statuses()[1].1.clone();
+    assert_eq!(st.state, TrackState::Recording);
+    assert!(st.idle);
+    // Kept up with the timeline while idle (minus idle_gap and poll jitter).
+    assert!(
+        st.frames_written as f64 / 48_000.0 > 0.4,
+        "{}",
+        st.frames_written
+    );
+
+    speakers.set(Mode::Ok);
+    thread::sleep(Duration::from_millis(400));
+    speakers.set(Mode::Stalled);
+    thread::sleep(Duration::from_millis(500));
+    speakers.set(Mode::Ok);
+    thread::sleep(Duration::from_millis(300));
+
+    let st = rec.statuses()[1].1.clone();
+    assert!(!st.idle);
+    assert_eq!(
+        st.reconnects, 0,
+        "quiet periods must not trigger reconnects"
+    );
+    assert_eq!(st.warnings.dropouts, 0);
+    let (dir, meta) = rec.stop(Duration::from_secs(5)).unwrap();
+
+    let mic = read_raw(&dir.join(&meta.tracks[0].raw_file));
+    let spk = read_raw(&dir.join(&meta.tracks[1].raw_file));
+    assert_eq!(mic.len(), spk.len());
+    // Playback started at ~0.6 s and resumed at ~1.5 s on the shared timeline.
+    let frames: Vec<bool> = spk.as_chunks::<2>().0.iter().map(|f| f[0] != 0.0).collect();
+    let first = frames.iter().position(|&a| a).unwrap() as f64 / 48_000.0;
+    assert!((0.55..0.8).contains(&first), "audio starts at {first}");
+    let resumed = frames[(1.2 * 48_000.0) as usize..]
+        .iter()
+        .position(|&a| a)
+        .unwrap() as f64
+        / 48_000.0
+        + 1.2;
+    assert!((1.45..1.7).contains(&resumed), "audio resumes at {resumed}");
 }

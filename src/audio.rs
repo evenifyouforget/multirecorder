@@ -59,7 +59,7 @@ pub trait InputSource: Send {
     fn open(&mut self, sink: StreamSink) -> Result<ActiveStream, String>;
 }
 
-/// An input device as shown in the device list.
+/// A recordable source as shown in the device list.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct InputDeviceInfo {
     /// Stable cpal device id (`host:id`), used to find the device again after a reconnect.
@@ -69,33 +69,65 @@ pub struct InputDeviceInfo {
     pub sample_rate: u32,
     pub channels: u16,
     pub sample_format: String,
+    /// An output device recorded via loopback (what is playing on it).
+    pub loopback: bool,
 }
 
-/// Lists input devices of every available audio host.
-pub fn list_input_devices() -> Vec<InputDeviceInfo> {
-    let mut out = Vec::new();
+impl InputDeviceInfo {
+    /// Unique key for remembering the selection; an endpoint's input and its
+    /// loopback are different sources.
+    pub fn key(&self) -> String {
+        if self.loopback {
+            format!("loopback:{}", self.id)
+        } else {
+            self.id.clone()
+        }
+    }
+}
+
+/// Hosts whose output devices can be recorded by opening them as an input.
+fn host_supports_loopback(host: cpal::HostId) -> bool {
+    matches!(host.name(), "WASAPI" | "CoreAudio")
+}
+
+/// Lists input devices, then loopback-capable output devices, of every host.
+pub fn list_devices() -> Vec<InputDeviceInfo> {
+    let mut inputs = Vec::new();
+    let mut loopbacks = Vec::new();
     for host_id in cpal::available_hosts() {
         let Ok(host) = cpal::host_from_id(host_id) else {
             continue;
         };
-        let Ok(devices) = host.input_devices() else {
+        let Ok(devices) = host.devices() else {
             continue;
         };
         for device in devices {
-            let (Ok(id), Ok(config)) = (device.id(), device.default_input_config()) else {
-                continue;
-            };
-            out.push(InputDeviceInfo {
+            let Ok(id) = device.id() else { continue };
+            let info = |config: cpal::SupportedStreamConfig, loopback| InputDeviceInfo {
                 id: id.to_string(),
                 name: device.to_string(),
                 host: host_id.name().to_string(),
                 sample_rate: config.sample_rate(),
                 channels: config.channels(),
                 sample_format: config.sample_format().to_string(),
-            });
+                loopback,
+            };
+            let input = device.default_input_config().ok();
+            if let Some(config) = input {
+                inputs.push(info(config, false));
+            }
+            // cpal only uses loopback for devices without inputs (macOS aggregates
+            // can have both); WASAPI endpoints are one or the other anyway.
+            if input.is_none()
+                && host_supports_loopback(host_id)
+                && let Ok(config) = device.default_output_config()
+            {
+                loopbacks.push(info(config, true));
+            }
         }
     }
-    out
+    inputs.extend(loopbacks);
+    inputs
 }
 
 /// Opens a device by id through cpal, keeping the format chosen at session start.
@@ -103,6 +135,8 @@ pub struct CpalSource {
     pub device_id: String,
     pub sample_rate: u32,
     pub channels: u16,
+    /// Record an output device through loopback.
+    pub loopback: bool,
 }
 
 /// Preferred native sample formats, best first. Everything is converted to f32.
@@ -125,9 +159,15 @@ impl InputSource for CpalSource {
         let host = cpal::host_from_id(id.host()).map_err(|e| e.to_string())?;
         let device = host.device_by_id(&id).ok_or("device not found")?;
 
-        let ranges: Vec<_> = device
-            .supported_input_configs()
-            .map_err(|e| e.to_string())?
+        // Loopback streams use the output device's formats.
+        let configs: Vec<_> = if self.loopback {
+            device.supported_output_configs().map(Iterator::collect)
+        } else {
+            device.supported_input_configs().map(Iterator::collect)
+        }
+        .map_err(|e| e.to_string())?;
+        let ranges: Vec<_> = configs
+            .into_iter()
             .filter(|r| r.channels() == self.channels && r.contains_rate(self.sample_rate))
             .collect();
         let format = FORMAT_PREFERENCE
