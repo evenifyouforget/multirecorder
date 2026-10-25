@@ -165,7 +165,7 @@ impl InputSource for CpalSource {
         } else {
             device.supported_input_configs().map(Iterator::collect)
         }
-        .map_err(|e| e.to_string())?;
+        .map_err(|e| describe_error(&e))?;
         let ranges: Vec<_> = configs
             .into_iter()
             .filter(|r| r.channels() == self.channels && r.contains_rate(self.sample_rate))
@@ -195,9 +195,26 @@ impl InputSource for CpalSource {
             SampleFormat::U8 => build::<u8>(&device, config, sink),
             other => return Err(format!("unsupported sample format {other}")),
         }
-        .map_err(|e| e.to_string())?;
-        stream.play().map_err(|e| e.to_string())?;
+        .map_err(|e| describe_error(&e))?;
+        stream.play().map_err(|e| describe_error(&e))?;
         Ok(Box::new(stream))
+    }
+}
+
+/// Turns cpal errors into something a user can act on; raw backend errors
+/// are kept as detail for the log.
+fn describe_error(err: &cpal::Error) -> String {
+    match err.kind() {
+        ErrorKind::DeviceBusy => format!(
+            "device is in use by another application in exclusive mode; close that \
+             application, or untick \"Allow applications to take exclusive control\" in the \
+             device's Windows Sound properties ({err})"
+        ),
+        ErrorKind::PermissionDenied => {
+            format!("access denied; check the system's microphone privacy settings ({err})")
+        }
+        ErrorKind::DeviceNotAvailable => "device not available (unplugged or disabled)".into(),
+        _ => err.to_string(),
     }
 }
 
@@ -232,6 +249,16 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn busy_device_error_explains_exclusive_mode() {
+        let err = cpal::Error::with_message(ErrorKind::DeviceBusy, "OS Error -2004287478");
+        let msg = describe_error(&err);
+        assert!(
+            msg.contains("exclusive mode") && msg.contains("-2004287478"),
+            "{msg}"
+        );
+    }
 
     #[test]
     fn push_converts_and_counts_overflow() {
