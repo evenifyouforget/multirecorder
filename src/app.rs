@@ -58,6 +58,8 @@ pub struct MultiRecorderApp {
     unexported: Vec<(PathBuf, SessionMeta)>,
     messages: Vec<String>,
     confirm_quit: bool,
+    /// Most recent session folder, for the "Open last session" button.
+    last_session: Option<PathBuf>,
 }
 
 impl MultiRecorderApp {
@@ -73,6 +75,7 @@ impl MultiRecorderApp {
             unexported: Vec::new(),
             messages: Vec::new(),
             confirm_quit: false,
+            last_session: None,
         };
         app.refresh_devices();
         app.rescan_sessions();
@@ -127,6 +130,7 @@ impl MultiRecorderApp {
         ) {
             Ok(rec) => {
                 self.message(format!("Recording to {}", rec.dir().display()));
+                self.last_session = Some(rec.dir().to_path_buf());
                 self.phase = Phase::Recording(rec);
             }
             Err(e) => self.message(format!("Could not start recording: {e:#}")),
@@ -152,6 +156,7 @@ impl MultiRecorderApp {
     }
 
     fn export_existing(&mut self, dir: PathBuf, ctx: &egui::Context) {
+        self.last_session = Some(dir.clone());
         let job = Arc::new(Mutex::new(Job::default()));
         let format = self.settings.format;
         spawn_job(job.clone(), ctx.clone(), move |job| {
@@ -167,7 +172,7 @@ impl MultiRecorderApp {
                 ui.label("Output folder:");
                 let edit = ui.add(
                     egui::TextEdit::singleline(&mut self.settings.output_dir)
-                        .desired_width(ui.available_width() - 90.0),
+                        .desired_width(ui.available_width() - 160.0),
                 );
                 if edit.lost_focus() {
                     self.rescan_sessions();
@@ -179,6 +184,13 @@ impl MultiRecorderApp {
                 {
                     self.settings.output_dir = dir.display().to_string();
                     self.rescan_sessions();
+                }
+                if ui
+                    .button("Open")
+                    .on_hover_text("Open the output folder")
+                    .clicked()
+                {
+                    self.open_folder(PathBuf::from(&self.settings.output_dir));
                 }
             });
             ui.horizontal(|ui| {
@@ -214,8 +226,16 @@ impl MultiRecorderApp {
         });
     }
 
-    fn controls_ui(&mut self, ui: &mut egui::Ui) {
+    fn open_folder(&mut self, path: PathBuf) {
+        if let Err(e) = open_folder(&path) {
+            self.message(format!("Could not open {}: {e}", path.display()));
+        }
+    }
+
+    /// Record/stop controls; always visible at the top of the window.
+    fn top_bar_ui(&mut self, ui: &mut egui::Ui) {
         let ctx = ui.ctx().clone();
+        ui.add_space(4.0);
         match &self.phase {
             Phase::Idle => {
                 let count = self
@@ -229,12 +249,19 @@ impl MultiRecorderApp {
                         self.start_recording();
                     }
                     ui.label(format!("{count} device(s) selected"));
+                    if let Some(dir) = self.last_session.clone() {
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            if ui.button("Open last session").clicked() {
+                                self.open_folder(dir);
+                            }
+                        });
+                    }
                 });
             }
             Phase::Recording(rec) => {
                 let elapsed = rec.elapsed().as_secs();
-                let statuses = rec.statuses();
-                let mut stop = false;
+                let dir = rec.dir().to_path_buf();
+                let (mut stop, mut open) = (false, false);
                 ui.horizontal(|ui| {
                     stop = ui
                         .button(egui::RichText::new("■  Stop").size(18.0))
@@ -249,48 +276,13 @@ impl MultiRecorderApp {
                         .size(18.0)
                         .monospace(),
                     );
-                });
-                egui::Grid::new("tracks")
-                    .striped(true)
-                    .num_columns(5)
-                    .show(ui, |ui| {
-                        for h in [
-                            "Device",
-                            "Status",
-                            "Recorded",
-                            "Silence inserted",
-                            "Reconnects",
-                        ] {
-                            ui.strong(h);
-                        }
-                        ui.end_row();
-                        for (meta, st) in &statuses {
-                            let rate = f64::from(meta.sample_rate);
-                            ui.label(&meta.device_name);
-                            let (text, color) = match &st.state {
-                                TrackState::Starting => {
-                                    ("starting".to_string(), egui::Color32::GRAY)
-                                }
-                                TrackState::Recording => (
-                                    "recording".to_string(),
-                                    egui::Color32::from_rgb(60, 170, 60),
-                                ),
-                                TrackState::Reconnecting(e) => (
-                                    format!("reconnecting: {e}"),
-                                    egui::Color32::from_rgb(220, 150, 0),
-                                ),
-                                TrackState::Stopped => ("stopped".to_string(), egui::Color32::GRAY),
-                                TrackState::Failed(e) => {
-                                    (format!("failed: {e}"), egui::Color32::from_rgb(210, 60, 60))
-                                }
-                            };
-                            ui.colored_label(color, text);
-                            ui.label(format!("{:.1} s", st.frames_written as f64 / rate));
-                            ui.label(format!("{:.1} s", st.silence_frames as f64 / rate));
-                            ui.label(st.reconnects.to_string());
-                            ui.end_row();
-                        }
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        open = ui.button("Open session folder").clicked();
                     });
+                });
+                if open {
+                    self.open_folder(dir);
+                }
                 if stop {
                     self.stop_recording(&ctx);
                 }
@@ -311,6 +303,54 @@ impl MultiRecorderApp {
                 }
             }
         }
+        ui.add_space(4.0);
+    }
+
+    fn tracks_ui(&mut self, ui: &mut egui::Ui) {
+        let Phase::Recording(rec) = &self.phase else {
+            return;
+        };
+        let statuses = rec.statuses();
+        ui.separator();
+        egui::Grid::new("tracks")
+            .striped(true)
+            .num_columns(5)
+            .show(ui, |ui| {
+                for h in [
+                    "Device",
+                    "Status",
+                    "Recorded",
+                    "Silence inserted",
+                    "Reconnects",
+                ] {
+                    ui.strong(h);
+                }
+                ui.end_row();
+                for (meta, st) in &statuses {
+                    let rate = f64::from(meta.sample_rate);
+                    ui.label(&meta.device_name);
+                    let (text, color) = match &st.state {
+                        TrackState::Starting => ("starting".to_string(), egui::Color32::GRAY),
+                        TrackState::Recording => (
+                            "recording".to_string(),
+                            egui::Color32::from_rgb(60, 170, 60),
+                        ),
+                        TrackState::Reconnecting(e) => (
+                            format!("reconnecting: {e}"),
+                            egui::Color32::from_rgb(220, 150, 0),
+                        ),
+                        TrackState::Stopped => ("stopped".to_string(), egui::Color32::GRAY),
+                        TrackState::Failed(e) => {
+                            (format!("failed: {e}"), egui::Color32::from_rgb(210, 60, 60))
+                        }
+                    };
+                    ui.colored_label(color, text);
+                    ui.label(format!("{:.1} s", st.frames_written as f64 / rate));
+                    ui.label(format!("{:.1} s", st.silence_frames as f64 / rate));
+                    ui.label(st.reconnects.to_string());
+                    ui.end_row();
+                }
+            });
     }
 
     fn unexported_ui(&mut self, ui: &mut egui::Ui) {
@@ -320,6 +360,7 @@ impl MultiRecorderApp {
         ui.separator();
         ui.strong("Sessions waiting for export");
         let mut export = None;
+        let mut open = None;
         for (dir, meta) in &self.unexported {
             ui.horizontal(|ui| {
                 let name = dir
@@ -341,12 +382,31 @@ impl MultiRecorderApp {
                 {
                     export = Some(dir.clone());
                 }
+                if ui.button("Open").clicked() {
+                    open = Some(dir.clone());
+                }
             });
+        }
+        if let Some(dir) = open {
+            self.open_folder(dir);
         }
         if let Some(dir) = export {
             self.export_existing(dir, ui.ctx());
         }
     }
+}
+
+/// Shows `path` in the system file browser, creating it first if needed.
+fn open_folder(path: &Path) -> std::io::Result<()> {
+    std::fs::create_dir_all(path)?;
+    #[cfg(target_os = "windows")]
+    let program = "explorer";
+    #[cfg(target_os = "macos")]
+    let program = "open";
+    #[cfg(not(any(target_os = "windows", target_os = "macos")))]
+    let program = "xdg-open";
+    std::process::Command::new(program).arg(path).spawn()?;
+    Ok(())
 }
 
 fn spawn_job(
@@ -388,27 +448,33 @@ impl eframe::App for MultiRecorderApp {
     }
 
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        // Fixed bars first so the record controls never scroll out of view.
+        egui::Panel::top("controls").show(ui, |ui| self.top_bar_ui(ui));
+        egui::Panel::bottom("messages")
+            .resizable(true)
+            .default_size(110.0)
+            .min_size(50.0)
+            .show(ui, |ui| {
+                ui.add_space(4.0);
+                ui.strong("Messages");
+                egui::ScrollArea::vertical()
+                    .id_salt("messages")
+                    .stick_to_bottom(true)
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| {
+                        for m in &self.messages {
+                            ui.label(m);
+                        }
+                    });
+            });
         egui::CentralPanel::default().show(ui, |ui| {
             egui::ScrollArea::vertical()
                 .id_salt("main")
-                .auto_shrink([false, true])
-                .max_height(ui.available_height() * 0.7)
-                .show(ui, |ui| {
-                    self.settings_ui(ui);
-                    ui.separator();
-                    self.controls_ui(ui);
-                    self.unexported_ui(ui);
-                });
-            ui.separator();
-            ui.strong("Messages");
-            egui::ScrollArea::vertical()
-                .id_salt("messages")
-                .stick_to_bottom(true)
                 .auto_shrink([false, false])
                 .show(ui, |ui| {
-                    for m in &self.messages {
-                        ui.label(m);
-                    }
+                    self.settings_ui(ui);
+                    self.tracks_ui(ui);
+                    self.unexported_ui(ui);
                 });
         });
 
