@@ -103,7 +103,7 @@ impl MultiRecorderApp {
     }
 
     fn refresh_devices(&mut self) {
-        self.devices = audio::list_input_devices();
+        self.devices = audio::list_devices();
     }
 
     fn rescan_sessions(&mut self) {
@@ -114,16 +114,22 @@ impl MultiRecorderApp {
         let specs: Vec<TrackSpec> = self
             .devices
             .iter()
-            .filter(|d| self.settings.selected.contains(&d.id))
+            .filter(|d| self.settings.selected.contains(&d.key()))
             .map(|d| TrackSpec {
-                device_name: d.name.clone(),
+                device_name: if d.loopback {
+                    format!("{} (loopback)", d.name)
+                } else {
+                    d.name.clone()
+                },
                 device_id: d.id.clone(),
                 sample_rate: d.sample_rate,
                 channels: d.channels,
+                loopback: d.loopback,
                 source: Box::new(CpalSource {
                     device_id: d.id.clone(),
                     sample_rate: d.sample_rate,
                     channels: d.channels,
+                    loopback: d.loopback,
                 }),
             })
             .collect();
@@ -210,20 +216,27 @@ impl MultiRecorderApp {
                     self.refresh_devices();
                 }
             });
-            if self.devices.is_empty() {
+            if !self.devices.iter().any(|d| !d.loopback) {
                 ui.label("No input devices found.");
             }
+            let mut shown_outputs_heading = false;
             for d in &self.devices {
-                let mut on = self.settings.selected.contains(&d.id);
+                if d.loopback && !shown_outputs_heading {
+                    shown_outputs_heading = true;
+                    ui.add_space(6.0);
+                    ui.strong("Output devices (records what is playing)");
+                }
+                let key = d.key();
+                let mut on = self.settings.selected.contains(&key);
                 let label = format!(
                     "{}   ({} · {} ch · {} Hz · {})",
                     d.name, d.host, d.channels, d.sample_rate, d.sample_format
                 );
                 if ui.checkbox(&mut on, label).changed() {
                     if on {
-                        self.settings.selected.insert(d.id.clone());
+                        self.settings.selected.insert(key);
                     } else {
-                        self.settings.selected.remove(&d.id);
+                        self.settings.selected.remove(&key);
                     }
                 }
             }
@@ -245,7 +258,7 @@ impl MultiRecorderApp {
                 let count = self
                     .devices
                     .iter()
-                    .filter(|d| self.settings.selected.contains(&d.id))
+                    .filter(|d| self.settings.selected.contains(&d.key()))
                     .count();
                 let button = egui::Button::new(egui::RichText::new("●  Record").size(18.0));
                 ui.horizontal(|ui| {
@@ -353,6 +366,9 @@ impl MultiRecorderApp {
                     level_meter(ui, &st.levels);
                     let (text, color) = match &st.state {
                         TrackState::Starting => ("starting".to_string(), egui::Color32::GRAY),
+                        TrackState::Recording if st.idle => {
+                            ("recording (idle)".to_string(), egui::Color32::GRAY)
+                        }
                         TrackState::Recording => ("recording".to_string(), GREEN),
                         TrackState::Reconnecting(e) => (format!("reconnecting: {e}"), ORANGE),
                         TrackState::Stopped => ("stopped".to_string(), egui::Color32::GRAY),

@@ -43,6 +43,9 @@ pub struct TrackMeta {
     pub device_id: String,
     pub sample_rate: u32,
     pub channels: u16,
+    /// Output device recorded via loopback. Absent in sessions from v0.1.
+    #[serde(default)]
+    pub loopback: bool,
 }
 
 impl TrackMeta {
@@ -205,6 +208,14 @@ mod tests {
     }
 
     #[test]
+    fn reads_v1_metadata_without_loopback_field() {
+        let json = r#"{"version":1,"started_at":"x","state":"stopped","tracks":[
+            {"raw_file":"01-a.f32","device_name":"a","device_id":"i","sample_rate":48000,"channels":2}]}"#;
+        let meta: SessionMeta = serde_json::from_str(json).unwrap();
+        assert!(!meta.tracks[0].loopback);
+    }
+
+    #[test]
     fn meta_roundtrip_and_discovery() {
         let root = tempfile::tempdir().unwrap();
         let dir = create_session_dir(root.path()).unwrap();
@@ -217,6 +228,7 @@ mod tests {
             device_id: "x".into(),
             sample_rate: 48000,
             channels: 2,
+            loopback: false,
         };
         let mut meta = SessionMeta::new(vec![track.clone()]);
         meta.save(&dir).unwrap();

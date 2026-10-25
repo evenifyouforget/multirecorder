@@ -35,6 +35,9 @@ pub struct RecorderConfig {
     pub flush_interval: Duration,
     /// Writer loop period.
     pub poll_interval: Duration,
+    /// Loopback sources send nothing while nothing plays; after this long
+    /// without data their track is filled with silence up to real time.
+    pub idle_gap: Duration,
 }
 
 impl Default for RecorderConfig {
@@ -45,6 +48,7 @@ impl Default for RecorderConfig {
             retry_interval: Duration::from_secs(2),
             flush_interval: Duration::from_secs(1),
             poll_interval: Duration::from_millis(15),
+            idle_gap: Duration::from_millis(100),
         }
     }
 }
@@ -66,6 +70,8 @@ pub struct TrackStatus {
     /// Frames of silence inserted for gaps (device missing, stalls, overflows).
     pub silence_frames: u64,
     pub reconnects: u32,
+    /// Loopback source currently delivering nothing (nothing is playing).
+    pub idle: bool,
     /// Per-channel meter level (linear peak with decay), for display.
     pub levels: Vec<f32>,
     pub warnings: Warnings,
@@ -77,6 +83,8 @@ pub struct TrackSpec {
     pub device_id: String,
     pub sample_rate: u32,
     pub channels: u16,
+    /// Output device recorded via loopback: silence is delivered as no data.
+    pub loopback: bool,
     pub source: Box<dyn InputSource>,
 }
 
@@ -111,6 +119,7 @@ impl Recorder {
                 device_id: s.device_id.clone(),
                 sample_rate: s.sample_rate,
                 channels: s.channels,
+                loopback: s.loopback,
             })
             .collect();
         let meta = SessionMeta::new(metas.clone());
@@ -141,6 +150,7 @@ impl Recorder {
                 frames_written: 0,
                 silence_frames: 0,
                 reconnects: 0,
+                idle: false,
                 levels: vec![0.0; usize::from(meta.channels)],
                 warnings: Warnings::default(),
             }));
@@ -150,6 +160,7 @@ impl Recorder {
                 writer: RawWriter::new(file, meta.channels),
                 sample_rate: meta.sample_rate,
                 channels: meta.channels,
+                loopback: meta.loopback,
                 start,
                 stop_at: stop_at.clone(),
                 status: status.clone(),
@@ -314,6 +325,7 @@ struct TrackWorker {
     writer: RawWriter,
     sample_rate: u32,
     channels: u16,
+    loopback: bool,
     start: Instant,
     stop_at: Arc<OnceLock<Instant>>,
     status: Arc<Mutex<TrackStatus>>,
@@ -394,6 +406,7 @@ impl TrackWorker {
         let mut warnings = Warnings::default();
         let mut levels = vec![0.0f32; usize::from(self.channels)];
         let mut last_meter = Instant::now();
+        let mut idle = false;
 
         loop {
             let now = Instant::now();
@@ -492,7 +505,10 @@ impl TrackWorker {
                         self.log.line(&format!("{}: {}", self.name, ev.message));
                     }
                 }
-                if failure.is_none() && now.duration_since(s.last_data) > self.config.stall_timeout
+                // A quiet loopback source is not a stalled one.
+                if failure.is_none()
+                    && !self.loopback
+                    && now.duration_since(s.last_data) > self.config.stall_timeout
                 {
                     failure = Some("no audio received (stalled)".to_string());
                 }
@@ -504,6 +520,21 @@ impl TrackWorker {
                     self.set_state(TrackState::Reconnecting(msg.clone()));
                     last_error = msg;
                     next_attempt = now;
+                }
+            }
+
+            let was_idle = idle;
+            idle = self.loopback
+                && stream
+                    .as_ref()
+                    .is_some_and(|s| now.duration_since(s.last_data) > self.config.idle_gap);
+            if idle {
+                // Nothing is playing: keep the track on the timeline so audio
+                // that starts later lands in the right place.
+                silence += self.writer.pad_to(self.timeline_frames(now))?;
+                if !was_idle {
+                    // Trailing zeros before the pause are not a dropout.
+                    analyzer.stream_restarted();
                 }
             }
 
@@ -547,6 +578,7 @@ impl TrackWorker {
                 st.frames_written = self.writer.frames();
                 st.silence_frames = silence;
                 st.levels.clone_from(&levels);
+                st.idle = idle;
                 st.warnings = warnings.clone();
             }
             thread::sleep(self.config.poll_interval);

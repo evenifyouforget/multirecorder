@@ -344,6 +344,7 @@ mod tests {
             device_id: "fake".into(),
             sample_rate: rate,
             channels,
+            loopback: false,
         };
         let bytes: Vec<u8> = samples.iter().flat_map(|s| s.to_le_bytes()).collect();
         fs::write(dir.join(&track.raw_file), bytes).unwrap();
