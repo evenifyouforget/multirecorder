@@ -9,11 +9,26 @@ CoreAudio on macOS, ALSA on Linux) and [egui](https://github.com/emilk/egui).
 ## Using it
 
 1. Pick an output folder and export format (FLAC 24-bit or WAV 32-bit float).
-2. Tick the input devices to record, press **Record**.
-3. Press **Stop**. Each device is exported to
+2. Tick the devices to record, press **Record**. Besides inputs, output devices
+   (speakers, headphones) can be recorded via loopback on Windows and macOS 14.6+.
+3. Watch the level meters and the **Warnings** column while recording.
+4. Press **Stop**. Each device is exported to
    `<output folder>/session-YYYYMMDD-HHMMSS/NN-<device>.flac|wav`.
+   **Open last session** shows the files.
 
 Each device records at its own native sample rate and channel count.
+
+### Warnings
+
+| Warning | Meaning |
+|---|---|
+| ⚠ choppy | Repeated short gaps of digital silence (3+ within 3 s): usually a driver, USB or buffer problem. |
+| ⚠ clipping | The signal hits full scale and is distorted; lower the input gain. |
+| no signal | Nothing above -80 dBFS for 5 s. Fine if the source is meant to be silent. |
+| reconnecting | The device is missing; its track is being filled with silence. |
+
+The top bar shows how many tracks need attention, and every warning is written
+to `session.log` in the session folder.
 
 ## Reliability
 
