@@ -374,7 +374,12 @@ impl MultiRecorderApp {
                         TrackState::Stopped => ("stopped".to_string(), egui::Color32::GRAY),
                         TrackState::Failed(e) => (format!("failed: {e}"), RED),
                     };
-                    ui.colored_label(color, text);
+                    ui.allocate_ui(egui::vec2(260.0, 18.0), |ui| {
+                        ui.add(
+                            egui::Label::new(egui::RichText::new(&text).color(color)).truncate(),
+                        )
+                        .on_hover_text(&text);
+                    });
                     warnings_label(ui, &st.warnings);
                     ui.label(format!("{:.1} s", st.frames_written as f64 / rate));
                     ui.label(format!("{:.1} s", st.silence_frames as f64 / rate))
