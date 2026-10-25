@@ -9,12 +9,16 @@ use std::time::Duration;
 use eframe::egui;
 use serde::{Deserialize, Serialize};
 
+use crate::analysis::Warnings;
 use crate::audio::{self, CpalSource, InputDeviceInfo};
 use crate::export::{self, ExportFormat};
-use crate::recorder::{Recorder, RecorderConfig, TrackSpec, TrackState};
+use crate::recorder::{Recorder, RecorderConfig, TrackSpec, TrackState, TrackStatus};
 use crate::session::{self, SessionMeta};
 
 const SETTINGS_KEY: &str = "settings";
+const GREEN: egui::Color32 = egui::Color32::from_rgb(60, 170, 60);
+const ORANGE: egui::Color32 = egui::Color32::from_rgb(220, 150, 0);
+const RED: egui::Color32 = egui::Color32::from_rgb(210, 60, 60);
 const MAX_MESSAGES: usize = 200;
 
 #[derive(Serialize, Deserialize)]
@@ -81,7 +85,7 @@ impl MultiRecorderApp {
         app.rescan_sessions();
         if !app.unexported.is_empty() {
             app.message(format!(
-                "Found {} session(s) that were not exported (possibly after a crash). See below.",
+                "Found {} session(s) that were not exported (possibly after a crash). See \"Sessions waiting for export\".",
                 app.unexported.len()
             ));
         }
@@ -261,6 +265,11 @@ impl MultiRecorderApp {
             Phase::Recording(rec) => {
                 let elapsed = rec.elapsed().as_secs();
                 let dir = rec.dir().to_path_buf();
+                let attention = rec
+                    .statuses()
+                    .iter()
+                    .filter(|(_, st)| needs_attention(st))
+                    .count();
                 let (mut stop, mut open) = (false, false);
                 ui.horizontal(|ui| {
                     stop = ui
@@ -276,6 +285,13 @@ impl MultiRecorderApp {
                         .size(18.0)
                         .monospace(),
                     );
+                    if attention > 0 {
+                        ui.colored_label(
+                            RED,
+                            egui::RichText::new(format!("⚠ {attention} track(s) need attention"))
+                                .strong(),
+                        );
+                    }
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         open = ui.button("Open session folder").clicked();
                     });
@@ -314,13 +330,15 @@ impl MultiRecorderApp {
         ui.separator();
         egui::Grid::new("tracks")
             .striped(true)
-            .num_columns(5)
+            .num_columns(7)
             .show(ui, |ui| {
                 for h in [
                     "Device",
+                    "Level",
                     "Status",
+                    "Warnings",
                     "Recorded",
-                    "Silence inserted",
+                    "Gaps",
                     "Reconnects",
                 ] {
                     ui.strong(h);
@@ -328,25 +346,25 @@ impl MultiRecorderApp {
                 ui.end_row();
                 for (meta, st) in &statuses {
                     let rate = f64::from(meta.sample_rate);
-                    ui.label(&meta.device_name);
+                    ui.allocate_ui(egui::vec2(220.0, 18.0), |ui| {
+                        ui.add(egui::Label::new(&meta.device_name).truncate())
+                            .on_hover_text(&meta.device_name);
+                    });
+                    level_meter(ui, &st.levels);
                     let (text, color) = match &st.state {
                         TrackState::Starting => ("starting".to_string(), egui::Color32::GRAY),
-                        TrackState::Recording => (
-                            "recording".to_string(),
-                            egui::Color32::from_rgb(60, 170, 60),
-                        ),
-                        TrackState::Reconnecting(e) => (
-                            format!("reconnecting: {e}"),
-                            egui::Color32::from_rgb(220, 150, 0),
-                        ),
+                        TrackState::Recording => ("recording".to_string(), GREEN),
+                        TrackState::Reconnecting(e) => (format!("reconnecting: {e}"), ORANGE),
                         TrackState::Stopped => ("stopped".to_string(), egui::Color32::GRAY),
-                        TrackState::Failed(e) => {
-                            (format!("failed: {e}"), egui::Color32::from_rgb(210, 60, 60))
-                        }
+                        TrackState::Failed(e) => (format!("failed: {e}"), RED),
                     };
                     ui.colored_label(color, text);
+                    warnings_label(ui, &st.warnings);
                     ui.label(format!("{:.1} s", st.frames_written as f64 / rate));
-                    ui.label(format!("{:.1} s", st.silence_frames as f64 / rate));
+                    ui.label(format!("{:.1} s", st.silence_frames as f64 / rate))
+                        .on_hover_text(
+                            "Silence inserted while the device was missing, stalled or overloaded",
+                        );
                     ui.label(st.reconnects.to_string());
                     ui.end_row();
                 }
@@ -396,6 +414,85 @@ impl MultiRecorderApp {
     }
 }
 
+fn needs_attention(st: &TrackStatus) -> bool {
+    st.warnings.any_problem()
+        || matches!(
+            st.state,
+            TrackState::Reconnecting(_) | TrackState::Failed(_)
+        )
+}
+
+/// One horizontal bar per channel, -60..0 dBFS.
+fn level_meter(ui: &mut egui::Ui, levels: &[f32]) {
+    let n = levels.len().max(1);
+    let bar = (18.0 / n as f32).clamp(2.0, 8.0);
+    let size = egui::vec2(140.0, bar * n as f32 + (n - 1) as f32);
+    let (rect, response) = ui.allocate_exact_size(size, egui::Sense::hover());
+    let painter = ui.painter();
+    painter.rect_filled(rect, 2.0, ui.visuals().extreme_bg_color);
+    let db = |l: f32| 20.0 * l.max(1e-6).log10();
+    for (i, &level) in levels.iter().enumerate() {
+        let frac = ((db(level) + 60.0) / 60.0).clamp(0.0, 1.0);
+        let color = if level >= 0.999 {
+            RED
+        } else if db(level) > -6.0 {
+            ORANGE
+        } else {
+            GREEN
+        };
+        let top = rect.top() + i as f32 * (bar + 1.0);
+        let fill = egui::Rect::from_min_size(
+            egui::pos2(rect.left(), top),
+            egui::vec2(rect.width() * frac, bar),
+        );
+        painter.rect_filled(fill, 1.0, color);
+    }
+    response.on_hover_text(
+        levels
+            .iter()
+            .enumerate()
+            .map(|(i, &l)| format!("ch {}: {:.1} dBFS", i + 1, db(l)))
+            .collect::<Vec<_>>()
+            .join("\n"),
+    );
+}
+
+fn warnings_label(ui: &mut egui::Ui, w: &Warnings) {
+    ui.horizontal(|ui| {
+        let mut any = false;
+        if w.choppy {
+            any = true;
+            ui.colored_label(RED, format!("⚠ choppy ({} dropouts)", w.dropouts))
+                .on_hover_text(
+                    "Repeated short gaps of digital silence: usually a driver, USB or \
+                     buffer problem. Check the recording.",
+                );
+        }
+        if w.clipping {
+            any = true;
+            ui.colored_label(RED, "⚠ clipping")
+                .on_hover_text("Signal hits full scale and is distorted. Lower the input gain.");
+        }
+        if w.no_signal {
+            any = true;
+            ui.colored_label(egui::Color32::GRAY, "no signal")
+                .on_hover_text("Nothing above -80 dBFS for 5 s. Fine if the source is silent.");
+        }
+        if !any {
+            let past = w.dropouts > 0 || w.clip_events > 0;
+            let text = if past {
+                format!(
+                    "ok ({} dropouts, {} clips earlier)",
+                    w.dropouts, w.clip_events
+                )
+            } else {
+                "—".to_string()
+            };
+            ui.weak(text);
+        }
+    });
+}
+
 /// Shows `path` in the system file browser, creating it first if needed.
 fn open_folder(path: &Path) -> std::io::Result<()> {
     std::fs::create_dir_all(path)?;
@@ -438,8 +535,8 @@ fn run_export(dir: &Path, format: ExportFormat, job: &Arc<Mutex<Job>>) -> Result
 impl eframe::App for MultiRecorderApp {
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         if !matches!(self.phase, Phase::Idle) {
-            // Keep status fresh; recording itself does not depend on the UI running.
-            ctx.request_repaint_after(Duration::from_millis(250));
+            // Keep meters and status fresh; recording itself does not depend on the UI running.
+            ctx.request_repaint_after(Duration::from_millis(66));
         }
         if ctx.input(|i| i.viewport().close_requested()) && !matches!(self.phase, Phase::Idle) {
             ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
@@ -468,7 +565,7 @@ impl eframe::App for MultiRecorderApp {
                     });
             });
         egui::CentralPanel::default().show(ui, |ui| {
-            egui::ScrollArea::vertical()
+            egui::ScrollArea::both()
                 .id_salt("main")
                 .auto_shrink([false, false])
                 .show(ui, |ui| {

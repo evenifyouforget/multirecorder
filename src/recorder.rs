@@ -19,6 +19,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 
+use crate::analysis::{Analyzer, Warnings};
 use crate::audio::{ActiveStream, InputSource, StreamEvent, StreamSink};
 use crate::session::{self, SessionLog, SessionMeta, SessionState, TrackMeta};
 
@@ -65,6 +66,9 @@ pub struct TrackStatus {
     /// Frames of silence inserted for gaps (device missing, stalls, overflows).
     pub silence_frames: u64,
     pub reconnects: u32,
+    /// Per-channel meter level (linear peak with decay), for display.
+    pub levels: Vec<f32>,
+    pub warnings: Warnings,
 }
 
 /// A device to record, with the format fixed at session start.
@@ -137,6 +141,8 @@ impl Recorder {
                 frames_written: 0,
                 silence_frames: 0,
                 reconnects: 0,
+                levels: vec![0.0; usize::from(meta.channels)],
+                warnings: Warnings::default(),
             }));
             let worker = TrackWorker {
                 name: format!("track {} ({})", i + 1, meta.device_name),
@@ -340,6 +346,26 @@ impl TrackWorker {
             .round() as u64
     }
 
+    fn log_warning_changes(&self, old: &Warnings, new: &Warnings) {
+        if new.choppy && !old.choppy {
+            self.log.line(&format!(
+                "{}: WARNING choppy audio (repeated dropouts; {} so far)",
+                self.name, new.dropouts
+            ));
+        }
+        if new.clipping && !old.clipping {
+            self.log.line(&format!("{}: WARNING clipping", self.name));
+        }
+        if new.no_signal != old.no_signal {
+            let what = if new.no_signal {
+                "no signal"
+            } else {
+                "signal back"
+            };
+            self.log.line(&format!("{}: {what}", self.name));
+        }
+    }
+
     fn set_state(&self, state: TrackState) {
         self.status.lock().expect("status lock").state = state;
     }
@@ -364,6 +390,10 @@ impl TrackWorker {
         let mut ever_connected = false;
         let mut last_sync = Instant::now();
         let mut silence = 0u64;
+        let mut analyzer = Analyzer::new(self.channels, self.sample_rate);
+        let mut warnings = Warnings::default();
+        let mut levels = vec![0.0f32; usize::from(self.channels)];
+        let mut last_meter = Instant::now();
 
         loop {
             let now = Instant::now();
@@ -395,6 +425,7 @@ impl TrackWorker {
                         drop(st);
                         ever_connected = true;
                         last_error.clear();
+                        analyzer.stream_restarted();
                         stream = Some(OpenStream {
                             _stream: s,
                             consumer,
@@ -418,7 +449,8 @@ impl TrackWorker {
 
             let limit = self.timeline_frames(now) + max_ahead;
             if let Some(s) = stream.as_mut() {
-                let (read, discarded) = drain(&mut s.consumer, &mut self.writer, limit)?;
+                let (read, discarded) =
+                    drain(&mut s.consumer, &mut self.writer, &mut analyzer, limit)?;
                 if read > 0 {
                     s.last_data = now;
                 }
@@ -467,7 +499,7 @@ impl TrackWorker {
                 if let Some(msg) = failure {
                     let mut dead = stream.take().expect("stream present");
                     drop(dead._stream);
-                    drain(&mut dead.consumer, &mut self.writer, limit)?;
+                    drain(&mut dead.consumer, &mut self.writer, &mut analyzer, limit)?;
                     self.log.line(&format!("{}: lost device: {msg}", self.name));
                     self.set_state(TrackState::Reconnecting(msg.clone()));
                     last_error = msg;
@@ -484,7 +516,7 @@ impl TrackWorker {
             if let Some(t) = stop_at {
                 if let Some(mut s) = stream.take() {
                     drop(s._stream);
-                    drain(&mut s.consumer, &mut self.writer, limit)?;
+                    drain(&mut s.consumer, &mut self.writer, &mut analyzer, limit)?;
                 }
                 let end = self.timeline_frames(t);
                 silence += self.writer.pad_to(end)?;
@@ -501,21 +533,33 @@ impl TrackWorker {
                 self.writer.sync()?;
                 last_sync = now;
             }
+            // Meters fall by 20 dB per second after a peak.
+            let decay = 10f32.powf(-now.duration_since(last_meter).as_secs_f32());
+            last_meter = now;
+            for (level, peak) in levels.iter_mut().zip(analyzer.take_peaks()) {
+                *level = peak.max(*level * decay);
+            }
+            let current = analyzer.warnings();
+            self.log_warning_changes(&warnings, &current);
+            warnings = current;
             {
                 let mut st = self.status.lock().expect("status lock");
                 st.frames_written = self.writer.frames();
                 st.silence_frames = silence;
+                st.levels.clone_from(&levels);
+                st.warnings = warnings.clone();
             }
             thread::sleep(self.config.poll_interval);
         }
     }
 }
 
-/// Empties the ring buffer, writing to disk until the file holds `max_frames`
-/// and discarding the rest. Returns (samples read, frames discarded).
+/// Empties the ring buffer, writing to disk (and the analyzer) until the file
+/// holds `max_frames` and discarding the rest. Returns (samples read, frames discarded).
 fn drain(
     consumer: &mut rtrb::Consumer<f32>,
     writer: &mut RawWriter,
+    analyzer: &mut Analyzer,
     max_frames: u64,
 ) -> std::io::Result<(usize, u64)> {
     let available = consumer.slots();
@@ -530,6 +574,8 @@ fn drain(
     let from_a = keep.min(a.len());
     writer.write_samples(&a[..from_a])?;
     writer.write_samples(&b[..keep - from_a])?;
+    analyzer.process(&a[..from_a]);
+    analyzer.process(&b[..keep - from_a]);
     chunk.commit_all();
     Ok((available, ((available - keep) / writer.channels) as u64))
 }

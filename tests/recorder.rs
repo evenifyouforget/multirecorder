@@ -20,6 +20,8 @@ enum Mode {
     Gone,
     /// Broken driver delivering audio far faster than real time.
     Flood,
+    /// Glitching driver: a 20 ms gap of digital silence every 200 ms.
+    Choppy,
 }
 
 #[derive(Clone)]
@@ -92,6 +94,17 @@ impl InputSource for FakeSource {
                             &vec![value; frames * usize::from(channels)],
                             usize::from(channels),
                         );
+                    }
+                    Mode::Choppy => {
+                        let period = u64::from(rate) / 5;
+                        let gap = u64::from(rate) / 50;
+                        let frames: Vec<f32> = (sent..due)
+                            .flat_map(|f| {
+                                let s = if f % period < gap { 0.0 } else { value };
+                                std::iter::repeat_n(s, usize::from(channels))
+                            })
+                            .collect();
+                        sink.push(&frames, usize::from(channels));
                     }
                     Mode::Stalled => {}
                     Mode::Gone => {
@@ -394,4 +407,30 @@ fn runaway_device_cannot_fill_the_disk() {
         .unwrap()
         .len();
     assert_eq!(ok_len, flood_len);
+}
+
+#[test]
+fn choppy_device_raises_warning_and_meters_move() {
+    let root = tempfile::tempdir().unwrap();
+    let ok = Control::new(Mode::Ok);
+    let choppy = Control::new(Mode::Choppy);
+    let rec = Recorder::start(
+        root.path(),
+        vec![
+            spec("ok", &ok, 48_000, 2, 0.5),
+            spec("choppy", &choppy, 48_000, 2, 0.5),
+        ],
+        test_config(),
+    )
+    .unwrap();
+    thread::sleep(Duration::from_millis(1500));
+    let statuses = rec.statuses();
+    let (ok_st, choppy_st) = (&statuses[0].1, &statuses[1].1);
+    assert!(!ok_st.warnings.any_problem(), "{:?}", ok_st.warnings);
+    assert!(ok_st.levels.iter().all(|&l| l > 0.3), "{:?}", ok_st.levels);
+    assert!(choppy_st.warnings.choppy, "{:?}", choppy_st.warnings);
+    assert!(choppy_st.warnings.dropouts >= 4);
+    let (dir, _) = rec.stop(Duration::from_secs(5)).unwrap();
+    let log = std::fs::read_to_string(dir.join(session::LOG_FILE)).unwrap();
+    assert!(log.contains("(choppy): WARNING choppy audio"), "{log}");
 }
