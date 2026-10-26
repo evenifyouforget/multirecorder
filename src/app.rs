@@ -4,7 +4,7 @@ use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use eframe::egui;
 use serde::{Deserialize, Serialize};
@@ -13,6 +13,7 @@ use crate::analysis::Warnings;
 use crate::audio::{self, CpalSource, InputDeviceInfo};
 use crate::export::{self, ExportFormat};
 use crate::recorder::{Load, Recorder, RecorderConfig, TrackSpec, TrackState, TrackStatus};
+use crate::resources;
 use crate::session::{self, SessionMeta};
 
 const SETTINGS_KEY: &str = "settings";
@@ -69,6 +70,10 @@ pub struct MultiRecorderApp {
     confirm_quit: bool,
     /// Most recent session folder, for the "Open last session" button.
     last_session: Option<PathBuf>,
+    /// Free disk space and process RAM, refreshed every couple of seconds.
+    resources: Option<(Instant, Option<u64>, Option<u64>)>,
+    /// Low-disk warning already shown for this recording.
+    warned_low_disk: bool,
 }
 
 impl MultiRecorderApp {
@@ -85,6 +90,8 @@ impl MultiRecorderApp {
             messages: Vec::new(),
             confirm_quit: false,
             last_session: None,
+            resources: None,
+            warned_low_disk: false,
         };
         app.refresh_devices();
         app.rescan_sessions();
@@ -363,7 +370,100 @@ impl MultiRecorderApp {
                 }
             }
         }
+        self.status_line(ui);
         ui.add_space(4.0);
+    }
+
+    /// Disk space, time left, RAM and load, under the record controls.
+    fn status_line(&mut self, ui: &mut egui::Ui) {
+        let stale = self
+            .resources
+            .is_none_or(|(at, _, _)| at.elapsed() >= Duration::from_secs(2));
+        if stale {
+            self.resources = Some((
+                Instant::now(),
+                resources::free_space(Path::new(&self.settings.output_dir)),
+                resources::process_ram(),
+            ));
+        }
+        let Some((_, free, ram)) = self.resources else {
+            return;
+        };
+        let format = self.settings.format;
+        // Disk rate and busiest track for what is (or would be) recorded.
+        let (rate, devices, busiest) = match &self.phase {
+            Phase::Recording(rec) => {
+                let statuses = rec.statuses();
+                let rate: f64 = statuses
+                    .iter()
+                    .map(|(m, _)| resources::track_disk_rate(m.sample_rate, m.channels, format))
+                    .sum();
+                let busiest = statuses
+                    .iter()
+                    .map(|(_, st)| st.load.max())
+                    .fold(0.0, f32::max);
+                (rate, statuses.len(), Some(busiest))
+            }
+            _ => {
+                let selected: Vec<_> = self
+                    .devices
+                    .iter()
+                    .filter(|d| self.settings.selected.contains(&d.key()))
+                    .collect();
+                let rate = selected
+                    .iter()
+                    .map(|d| resources::track_disk_rate(d.sample_rate, d.channels, format))
+                    .sum();
+                (rate, selected.len(), None)
+            }
+        };
+        let recording = busiest.is_some();
+        let left = free.and_then(|f| resources::time_left(f, rate));
+        if recording && !self.warned_low_disk && left.is_some_and(|l| l < Duration::from_secs(600))
+        {
+            self.warned_low_disk = true;
+            self.message("Low disk space: less than 10 minutes of recording left.");
+        }
+        if !recording {
+            self.warned_low_disk = false;
+        }
+
+        ui.horizontal_wrapped(|ui| {
+            ui.spacing_mut().item_spacing.x = 4.0;
+            match free {
+                Some(f) => ui.weak(format!("Disk: {} free", resources::format_bytes(f))),
+                None => ui.weak("Disk: unknown"),
+            };
+            if let Some(left) = left {
+                let color = if left < Duration::from_secs(600) {
+                    RED
+                } else if left < Duration::from_secs(3600) {
+                    ORANGE
+                } else {
+                    ui.visuals().weak_text_color()
+                };
+                let text = if recording {
+                    format!("· ~{} left", resources::format_duration(left))
+                } else {
+                    format!(
+                        "· enough for ~{} with {devices} device(s)",
+                        resources::format_duration(left)
+                    )
+                };
+                ui.colored_label(color, text).on_hover_text(
+                    "Estimate: raw capture plus the export growing beside it \
+                     (raw files are deleted when the recording is finished).",
+                );
+            }
+            if let Some(ram) = ram {
+                ui.weak(format!("· RAM: {}", resources::format_bytes(ram)));
+            }
+            if let Some(busiest) = busiest {
+                ui.weak("· Load:");
+                ui.colored_label(load_color(busiest), format!("{:.1}%", busiest * 100.0))
+                    .on_hover_text("Busiest stage of the busiest track; see the Load column.");
+            }
+        });
     }
 
     fn tracks_ui(&mut self, ui: &mut egui::Ui) {
