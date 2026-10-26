@@ -471,6 +471,8 @@ pub struct LiveExportControl {
     pub cancel: AtomicBool,
     /// Frames encoded so far.
     pub done_frames: AtomicU64,
+    /// Time spent reading and encoding (excluding waits), for load display.
+    pub busy_nanos: AtomicU64,
 }
 
 /// Exports a track while it is being recorded by following its raw capture.
@@ -526,11 +528,14 @@ fn follow(
         let final_frames = ctl.final_frames.get().copied();
         let target = final_frames.unwrap_or_else(|| ctl.ready_frames.load(Ordering::Acquire));
         if done < target {
+            let started = std::time::Instant::now();
             let n = (target - done).min(CHUNK_FRAMES as u64);
             read_frames(&mut reader, n, track.channels, &mut chunk)?;
             encoder.write(&chunk)?;
             done += n;
             ctl.done_frames.store(done, Ordering::Relaxed);
+            ctl.busy_nanos
+                .fetch_add(started.elapsed().as_nanos() as u64, Ordering::Relaxed);
         } else if final_frames.is_some() {
             let path = encoder.finish()?;
             fs::remove_file(raw).with_context(|| format!("removing {}", raw.display()))?;

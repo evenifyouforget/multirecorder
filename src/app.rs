@@ -12,7 +12,7 @@ use serde::{Deserialize, Serialize};
 use crate::analysis::Warnings;
 use crate::audio::{self, CpalSource, InputDeviceInfo};
 use crate::export::{self, ExportFormat};
-use crate::recorder::{Recorder, RecorderConfig, TrackSpec, TrackState, TrackStatus};
+use crate::recorder::{Load, Recorder, RecorderConfig, TrackSpec, TrackState, TrackStatus};
 use crate::session::{self, SessionMeta};
 
 const SETTINGS_KEY: &str = "settings";
@@ -373,7 +373,7 @@ impl MultiRecorderApp {
         let statuses = rec.statuses();
         egui::Grid::new("tracks")
             .striped(true)
-            .num_columns(7)
+            .num_columns(8)
             .show(ui, |ui| {
                 for h in [
                     "Device",
@@ -383,6 +383,7 @@ impl MultiRecorderApp {
                     "Recorded",
                     "Gaps",
                     "Reconnects",
+                    "Load",
                 ] {
                     ui.strong(h);
                 }
@@ -417,6 +418,7 @@ impl MultiRecorderApp {
                             "Silence inserted while the device was missing, stalled or overloaded",
                         );
                     ui.label(st.reconnects.to_string());
+                    load_label(ui, &st.load);
                     ui.end_row();
                 }
             });
@@ -506,6 +508,32 @@ fn level_meter(ui: &mut egui::Ui, levels: &[f32]) {
             .collect::<Vec<_>>()
             .join("\n"),
     );
+}
+
+fn load_color(load: f32) -> egui::Color32 {
+    if load >= 0.8 {
+        RED
+    } else if load >= 0.5 {
+        ORANGE
+    } else {
+        GREEN
+    }
+}
+
+/// Busiest stage as a percentage of one CPU core, with a breakdown on hover.
+fn load_label(ui: &mut egui::Ui, load: &Load) {
+    let pct = |f: f32| format!("{:.1}%", f * 100.0);
+    ui.colored_label(load_color(load.max()), pct(load.max()))
+        .on_hover_text(format!(
+            "Share of real time each stage needs on one CPU core.\n\
+             100% = barely keeping up.\n\n\
+             Audio callback: {}  (hard real-time deadline)\n\
+             Writer: {}  (disk writes + analysis; 4 s buffer)\n\
+             Live export: {}  (if it falls behind, Stop takes longer)",
+            pct(load.callback),
+            pct(load.writer),
+            pct(load.export)
+        ));
 }
 
 fn warnings_label(ui: &mut egui::Ui, w: &Warnings) {

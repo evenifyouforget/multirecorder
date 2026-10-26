@@ -78,9 +78,29 @@ pub struct TrackStatus {
     pub idle: bool,
     /// Frames already exported during recording (live export only).
     pub exported_frames: u64,
+    pub load: Load,
     /// Per-channel meter level (linear peak with decay), for display.
     pub levels: Vec<f32>,
     pub warnings: Warnings,
+}
+
+/// Share of one CPU core each stage of a track uses, as a fraction of real
+/// time (1.0 = busy all the time, i.e. barely keeping up).
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct Load {
+    /// Our code inside the real-time audio callback (hard deadline).
+    pub callback: f32,
+    /// Writer thread: draining, analysis and disk writes (4 s of slack).
+    pub writer: f32,
+    /// Live export encoding (only delays Stop if it falls behind).
+    pub export: f32,
+}
+
+impl Load {
+    /// The most loaded stage.
+    pub fn max(&self) -> f32 {
+        self.callback.max(self.writer).max(self.export)
+    }
 }
 
 /// A device to record, with the format fixed at session start.
@@ -159,6 +179,7 @@ impl Recorder {
                 reconnects: 0,
                 idle: false,
                 exported_frames: 0,
+                load: Load::default(),
                 levels: vec![0.0; usize::from(meta.channels)],
                 warnings: Warnings::default(),
             }));
@@ -476,6 +497,10 @@ impl TrackWorker {
         let mut levels = vec![0.0f32; usize::from(self.channels)];
         let mut last_meter = Instant::now();
         let mut idle = false;
+        let callback_busy = Arc::new(AtomicU64::new(0));
+        let mut writer_busy = Duration::ZERO;
+        let mut load_window = (Instant::now(), 0u64, 0u64);
+        let mut load = Load::default();
 
         loop {
             let now = Instant::now();
@@ -488,6 +513,7 @@ impl TrackWorker {
                     producer,
                     dropped_samples: dropped.clone(),
                     events: events_tx,
+                    busy_nanos: callback_busy.clone(),
                 };
                 match self.source.open(sink) {
                     Ok(s) => {
@@ -657,10 +683,28 @@ impl TrackWorker {
                 st.silence_frames = silence;
                 st.levels.clone_from(&levels);
                 st.idle = idle;
+                st.load = load;
                 if let Some(e) = &self.export {
                     st.exported_frames = e.done_frames.load(Ordering::Relaxed);
                 }
                 st.warnings = warnings.clone();
+            }
+            writer_busy += now.elapsed();
+            let window = now.duration_since(load_window.0);
+            if window >= Duration::from_secs(1) {
+                let cb = callback_busy.load(Ordering::Relaxed);
+                let ex = self
+                    .export
+                    .as_ref()
+                    .map_or(0, |e| e.busy_nanos.load(Ordering::Relaxed));
+                let secs = window.as_secs_f32();
+                load = Load {
+                    callback: (cb - load_window.1) as f32 / 1e9 / secs,
+                    writer: writer_busy.as_secs_f32() / secs,
+                    export: (ex - load_window.2) as f32 / 1e9 / secs,
+                };
+                load_window = (now, cb, ex);
+                writer_busy = Duration::ZERO;
             }
             thread::sleep(self.config.poll_interval);
         }

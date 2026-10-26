@@ -7,6 +7,7 @@ use std::any::Any;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::Sender;
+use std::time::Instant;
 
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::{DeviceId, ErrorKind, FromSample, SampleFormat, SizedSample, StreamConfig};
@@ -27,6 +28,8 @@ pub struct StreamSink {
     /// them with silence so the track stays aligned.
     pub dropped_samples: Arc<AtomicU64>,
     pub events: Sender<StreamEvent>,
+    /// Time spent in `push`, i.e. our share of the real-time audio callback.
+    pub busy_nanos: Arc<AtomicU64>,
 }
 
 impl StreamSink {
@@ -36,6 +39,7 @@ impl StreamSink {
         T: Copy,
         f32: FromSample<T>,
     {
+        let started = Instant::now();
         let fit = data.len().min(self.producer.slots());
         let fit = fit - fit % channels.max(1);
         if fit > 0
@@ -47,6 +51,8 @@ impl StreamSink {
             self.dropped_samples
                 .fetch_add((data.len() - fit) as u64, Ordering::Relaxed);
         }
+        self.busy_nanos
+            .fetch_add(started.elapsed().as_nanos() as u64, Ordering::Relaxed);
     }
 }
 
@@ -269,6 +275,7 @@ mod tests {
             producer,
             dropped_samples: dropped.clone(),
             events: tx,
+            busy_nanos: Arc::default(),
         };
 
         sink.push(&[i16::MAX, 0, i16::MIN, 0, 1, 1], 2);

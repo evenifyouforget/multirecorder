@@ -529,6 +529,13 @@ fn live_export_runs_during_recording_and_matches_timeline() {
             let behind =
                 (st.frames_written - st.exported_frames) as f64 / f64::from(meta.sample_rate);
             assert!(st.exported_frames > 0 && behind < 0.5, "{format:?} {st:?}");
+            // Load is measured for every stage and is far from saturated.
+            let l = st.load;
+            assert!(
+                l.callback > 0.0 && l.writer > 0.0 && l.export > 0.0,
+                "{l:?}"
+            );
+            assert!(l.max() < 0.5, "{l:?}");
         }
 
         let mut last = -1.0f32;
