@@ -21,6 +21,7 @@ use anyhow::{Context, Result};
 
 use crate::analysis::{Analyzer, Warnings};
 use crate::audio::{ActiveStream, InputSource, StreamEvent, StreamSink};
+use crate::export::{ExportFormat, LiveExport, LiveExportControl};
 use crate::session::{self, SessionLog, SessionMeta, SessionState, TrackMeta};
 
 #[derive(Clone, Debug)]
@@ -38,6 +39,8 @@ pub struct RecorderConfig {
     /// Loopback sources send nothing while nothing plays; after this long
     /// without data their track is filled with silence up to real time.
     pub idle_gap: Duration,
+    /// Export to this format alongside the recording, so stopping is quick.
+    pub live_export: Option<ExportFormat>,
 }
 
 impl Default for RecorderConfig {
@@ -49,6 +52,7 @@ impl Default for RecorderConfig {
             flush_interval: Duration::from_secs(1),
             poll_interval: Duration::from_millis(15),
             idle_gap: Duration::from_millis(100),
+            live_export: None,
         }
     }
 }
@@ -72,9 +76,31 @@ pub struct TrackStatus {
     pub reconnects: u32,
     /// Loopback source currently delivering nothing (nothing is playing).
     pub idle: bool,
+    /// Frames already exported during recording (live export only).
+    pub exported_frames: u64,
+    pub load: Load,
     /// Per-channel meter level (linear peak with decay), for display.
     pub levels: Vec<f32>,
     pub warnings: Warnings,
+}
+
+/// Share of one CPU core each stage of a track uses, as a fraction of real
+/// time (1.0 = busy all the time, i.e. barely keeping up).
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct Load {
+    /// Our code inside the real-time audio callback (hard deadline).
+    pub callback: f32,
+    /// Writer thread: draining, analysis and disk writes (4 s of slack).
+    pub writer: f32,
+    /// Live export encoding (only delays Stop if it falls behind).
+    pub export: f32,
+}
+
+impl Load {
+    /// The most loaded stage.
+    pub fn max(&self) -> f32 {
+        self.callback.max(self.writer).max(self.export)
+    }
 }
 
 /// A device to record, with the format fixed at session start.
@@ -92,6 +118,7 @@ struct Track {
     meta: TrackMeta,
     status: Arc<Mutex<TrackStatus>>,
     thread: Option<JoinHandle<()>>,
+    export: Option<LiveExport>,
 }
 
 pub struct Recorder {
@@ -132,6 +159,7 @@ impl Recorder {
                 File::create(&path).with_context(|| format!("creating {}", path.display()))
             })
             .collect::<Result<Vec<_>>>()?;
+        session::sync_dir(&dir);
 
         log.line(&format!("recording started in {}", dir.display()));
         let start = Instant::now();
@@ -151,9 +179,18 @@ impl Recorder {
                 silence_frames: 0,
                 reconnects: 0,
                 idle: false,
+                exported_frames: 0,
+                load: Load::default(),
                 levels: vec![0.0; usize::from(meta.channels)],
                 warnings: Warnings::default(),
             }));
+            // Export runs beside the recording; if it can't start, the track is
+            // simply exported after Stop instead.
+            let export = config.live_export.and_then(|format| {
+                LiveExport::spawn(&dir, &meta, format)
+                    .inspect_err(|e| log.line(&format!("live export unavailable: {e:#}")))
+                    .ok()
+            });
             let worker = TrackWorker {
                 name: format!("track {} ({})", i + 1, meta.device_name),
                 source: spec.source,
@@ -166,6 +203,7 @@ impl Recorder {
                 status: status.clone(),
                 log: log.clone(),
                 config: config.clone(),
+                export: export.as_ref().map(|e| e.control.clone()),
             };
             let thread = thread::Builder::new()
                 .name(format!("track-{}", i + 1))
@@ -175,6 +213,7 @@ impl Recorder {
                 meta,
                 status,
                 thread: Some(thread),
+                export,
             });
         }
         Ok(Self {
@@ -213,7 +252,18 @@ impl Recorder {
     ///
     /// A track thread stuck inside a driver call is abandoned after `timeout`;
     /// its raw file is still valid and gets exported with whatever it holds.
-    pub fn stop(mut self, timeout: Duration) -> Result<(PathBuf, SessionMeta)> {
+    pub fn stop(self, timeout: Duration) -> Result<(PathBuf, SessionMeta)> {
+        self.stop_with_progress(timeout, &mut |_| {})
+    }
+
+    /// Like [`Recorder::stop`], then waits for live exports to finish the last
+    /// few seconds. `progress` receives 0..=1 for that wait. Tracks whose live
+    /// export failed keep their raw capture for [`crate::export::export_session`].
+    pub fn stop_with_progress(
+        mut self,
+        timeout: Duration,
+        progress: &mut dyn FnMut(f32),
+    ) -> Result<(PathBuf, SessionMeta)> {
         let _ = self.stop_at.set(Instant::now());
         let deadline = Instant::now() + timeout;
         for track in &mut self.tracks {
@@ -230,8 +280,12 @@ impl Recorder {
                     "{} did not stop in time; abandoning it",
                     track.meta.device_name
                 ));
+                if let Some(e) = &track.export {
+                    e.control.cancel.store(true, Ordering::Relaxed);
+                }
             }
         }
+        self.finish_exports(progress);
         self.meta.state = SessionState::Stopped;
         self.meta.save(&self.dir)?;
         self.log.line(&format!(
@@ -239,6 +293,38 @@ impl Recorder {
             self.elapsed().as_secs_f64()
         ));
         Ok((self.dir.clone(), self.meta.clone()))
+    }
+}
+
+impl Recorder {
+    fn finish_exports(&mut self, progress: &mut dyn FnMut(f32)) {
+        let exports: Vec<(String, LiveExport)> = self
+            .tracks
+            .iter_mut()
+            .filter_map(|t| Some((t.meta.device_name.clone(), t.export.take()?)))
+            .collect();
+        let total: u64 = exports
+            .iter()
+            .map(|(_, e)| e.control.final_frames.get().copied().unwrap_or(0))
+            .sum::<u64>()
+            .max(1);
+        while !exports.iter().all(|(_, e)| e.is_finished()) {
+            let done: u64 = exports
+                .iter()
+                .map(|(_, e)| e.control.done_frames.load(Ordering::Relaxed))
+                .sum();
+            progress(done as f32 / total as f32);
+            thread::sleep(Duration::from_millis(50));
+        }
+        for (name, export) in exports {
+            match export.join() {
+                Ok(path) => self.log.line(&format!("exported {}", path.display())),
+                Err(e) => self.log.line(&format!(
+                    "{name}: live export did not complete ({e:#}); exporting from the raw capture"
+                )),
+            }
+        }
+        progress(1.0);
     }
 }
 
@@ -331,6 +417,7 @@ struct TrackWorker {
     status: Arc<Mutex<TrackStatus>>,
     log: Arc<SessionLog>,
     config: RecorderConfig,
+    export: Option<Arc<LiveExportControl>>,
 }
 
 impl TrackWorker {
@@ -338,6 +425,7 @@ impl TrackWorker {
         let status = self.status.clone();
         let log = self.log.clone();
         let name = self.name.clone();
+        let export = self.export.clone();
         let result = std::panic::catch_unwind(AssertUnwindSafe(|| self.run()));
         let failure = match result {
             Ok(Ok(())) => None,
@@ -345,6 +433,9 @@ impl TrackWorker {
             Err(_) => Some("internal error (panic)".to_string()),
         };
         if let Some(msg) = failure {
+            if let Some(e) = &export {
+                e.cancel.store(true, Ordering::Relaxed);
+            }
             log.line(&format!("{name}: stopped recording: {msg}"));
             if let Ok(mut s) = status.lock() {
                 s.state = TrackState::Failed(msg);
@@ -407,6 +498,10 @@ impl TrackWorker {
         let mut levels = vec![0.0f32; usize::from(self.channels)];
         let mut last_meter = Instant::now();
         let mut idle = false;
+        let callback_busy = Arc::new(AtomicU64::new(0));
+        let mut writer_busy = Duration::ZERO;
+        let mut load_window = (Instant::now(), 0u64, 0u64);
+        let mut load = Load::default();
 
         loop {
             let now = Instant::now();
@@ -419,6 +514,7 @@ impl TrackWorker {
                     producer,
                     dropped_samples: dropped.clone(),
                     events: events_tx,
+                    busy_nanos: callback_busy.clone(),
                 };
                 match self.source.open(sink) {
                     Ok(s) => {
@@ -553,6 +649,9 @@ impl TrackWorker {
                 silence += self.writer.pad_to(end)?;
                 self.writer.truncate_to(end)?;
                 self.writer.sync()?;
+                if let Some(e) = &self.export {
+                    let _ = e.final_frames.set(self.writer.frames());
+                }
                 let mut st = self.status.lock().expect("status lock");
                 st.state = TrackState::Stopped;
                 st.frames_written = self.writer.frames();
@@ -563,6 +662,12 @@ impl TrackWorker {
             if now.duration_since(last_sync) >= self.config.flush_interval {
                 self.writer.sync()?;
                 last_sync = now;
+                if let Some(e) = &self.export {
+                    // Frames up to the current timeline position can never be
+                    // truncated at stop, so the exporter may consume them.
+                    let ready = self.writer.frames().min(self.timeline_frames(now));
+                    e.ready_frames.store(ready, Ordering::Release);
+                }
             }
             // Meters fall by 20 dB per second after a peak.
             let decay = 10f32.powf(-now.duration_since(last_meter).as_secs_f32());
@@ -579,7 +684,28 @@ impl TrackWorker {
                 st.silence_frames = silence;
                 st.levels.clone_from(&levels);
                 st.idle = idle;
+                st.load = load;
+                if let Some(e) = &self.export {
+                    st.exported_frames = e.done_frames.load(Ordering::Relaxed);
+                }
                 st.warnings = warnings.clone();
+            }
+            writer_busy += now.elapsed();
+            let window = now.duration_since(load_window.0);
+            if window >= Duration::from_secs(1) {
+                let cb = callback_busy.load(Ordering::Relaxed);
+                let ex = self
+                    .export
+                    .as_ref()
+                    .map_or(0, |e| e.busy_nanos.load(Ordering::Relaxed));
+                let secs = window.as_secs_f32();
+                load = Load {
+                    callback: (cb - load_window.1) as f32 / 1e9 / secs,
+                    writer: writer_busy.as_secs_f32() / secs,
+                    export: (ex - load_window.2) as f32 / 1e9 / secs,
+                };
+                load_window = (now, cb, ex);
+                writer_busy = Duration::ZERO;
             }
             thread::sleep(self.config.poll_interval);
         }

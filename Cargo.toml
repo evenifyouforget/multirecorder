@@ -1,6 +1,6 @@
 [package]
 name = "multirecorder"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2024"
 rust-version = "1.88"
 
@@ -12,7 +12,9 @@ dirs = "7.0.0"
 eframe = { version = "0.37.0", features = ["glow", "persistence"] }
 env_logger = "0.11.11"
 flacenc = "0.5.1"
+fs4 = "1.1.0"
 log = "0.4.34"
+memory-stats = "1.2.0"
 rfd = "0.17.2"
 rtrb = "0.4.0"
 serde = { version = "1.0.229", features = ["derive"] }

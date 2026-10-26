@@ -4,7 +4,7 @@ use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use eframe::egui;
 use serde::{Deserialize, Serialize};
@@ -12,7 +12,8 @@ use serde::{Deserialize, Serialize};
 use crate::analysis::Warnings;
 use crate::audio::{self, CpalSource, InputDeviceInfo};
 use crate::export::{self, ExportFormat};
-use crate::recorder::{Recorder, RecorderConfig, TrackSpec, TrackState, TrackStatus};
+use crate::recorder::{Load, Recorder, RecorderConfig, TrackSpec, TrackState, TrackStatus};
+use crate::resources;
 use crate::session::{self, SessionMeta};
 
 const SETTINGS_KEY: &str = "settings";
@@ -22,10 +23,14 @@ const RED: egui::Color32 = egui::Color32::from_rgb(210, 60, 60);
 const MAX_MESSAGES: usize = 200;
 
 #[derive(Serialize, Deserialize)]
+// Fields added later fall back to defaults instead of discarding saved settings.
+#[serde(default)]
 struct Settings {
     output_dir: String,
     format: ExportFormat,
     selected: BTreeSet<String>,
+    /// Hide devices that are not ticked.
+    only_selected: bool,
 }
 
 impl Default for Settings {
@@ -37,6 +42,7 @@ impl Default for Settings {
             output_dir: base.join("multirecorder").display().to_string(),
             format: ExportFormat::Flac,
             selected: BTreeSet::new(),
+            only_selected: false,
         }
     }
 }
@@ -64,6 +70,10 @@ pub struct MultiRecorderApp {
     confirm_quit: bool,
     /// Most recent session folder, for the "Open last session" button.
     last_session: Option<PathBuf>,
+    /// Free disk space and process RAM, refreshed every couple of seconds.
+    resources: Option<(Instant, Option<u64>, Option<u64>)>,
+    /// Low-disk warning already shown for this recording.
+    warned_low_disk: bool,
 }
 
 impl MultiRecorderApp {
@@ -80,6 +90,8 @@ impl MultiRecorderApp {
             messages: Vec::new(),
             confirm_quit: false,
             last_session: None,
+            resources: None,
+            warned_low_disk: false,
         };
         app.refresh_devices();
         app.rescan_sessions();
@@ -136,7 +148,10 @@ impl MultiRecorderApp {
         match Recorder::start(
             Path::new(&self.settings.output_dir),
             specs,
-            RecorderConfig::default(),
+            RecorderConfig {
+                live_export: Some(self.settings.format),
+                ..RecorderConfig::default()
+            },
         ) {
             Ok(rec) => {
                 self.message(format!("Recording to {}", rec.dir().display()));
@@ -157,9 +172,15 @@ impl MultiRecorderApp {
         }));
         let format = self.settings.format;
         spawn_job(job.clone(), ctx.clone(), move |job| {
+            let mut progress = |p: f32| {
+                let mut j = job.lock().expect("job lock");
+                j.text = "Finishing export…".into();
+                j.progress = p;
+            };
             let (dir, _) = rec
-                .stop(Duration::from_secs(5))
+                .stop_with_progress(Duration::from_secs(5), &mut progress)
                 .map_err(|e| format!("{e:#}"))?;
+            // Picks up any track whose live export failed.
             run_export(&dir, format, job)
         });
         self.phase = Phase::Finishing(job);
@@ -175,72 +196,89 @@ impl MultiRecorderApp {
         self.phase = Phase::Finishing(job);
     }
 
+    /// Output folder, format and device picker. Only shown while idle: none of
+    /// it can change during a recording, and hiding it keeps the meters in view.
     fn settings_ui(&mut self, ui: &mut egui::Ui) {
-        let idle = matches!(self.phase, Phase::Idle);
-        ui.add_enabled_ui(idle, |ui| {
-            ui.horizontal(|ui| {
-                ui.label("Output folder:");
-                let edit = ui.add(
-                    egui::TextEdit::singleline(&mut self.settings.output_dir)
-                        .desired_width(ui.available_width() - 160.0),
-                );
-                if edit.lost_focus() {
-                    self.rescan_sessions();
-                }
-                if ui.button("Browse…").clicked()
-                    && let Some(dir) = rfd::FileDialog::new()
-                        .set_directory(&self.settings.output_dir)
-                        .pick_folder()
-                {
-                    self.settings.output_dir = dir.display().to_string();
-                    self.rescan_sessions();
-                }
-                if ui
-                    .button("Open")
-                    .on_hover_text("Open the output folder")
-                    .clicked()
-                {
-                    self.open_folder(PathBuf::from(&self.settings.output_dir));
-                }
-            });
-            ui.horizontal(|ui| {
-                ui.label("Export format:");
-                for f in [ExportFormat::Flac, ExportFormat::Wav] {
-                    ui.radio_value(&mut self.settings.format, f, f.label());
-                }
-            });
-            ui.add_space(6.0);
-            ui.horizontal(|ui| {
-                ui.strong("Input devices");
-                if ui.button("Refresh").clicked() {
-                    self.refresh_devices();
-                }
-            });
-            if !self.devices.iter().any(|d| !d.loopback) {
-                ui.label("No input devices found.");
+        ui.horizontal(|ui| {
+            ui.label("Output folder:");
+            let edit = ui.add(
+                egui::TextEdit::singleline(&mut self.settings.output_dir)
+                    .desired_width(ui.available_width() - 160.0),
+            );
+            if edit.lost_focus() {
+                self.rescan_sessions();
             }
-            let mut shown_outputs_heading = false;
-            for d in &self.devices {
-                if d.loopback && !shown_outputs_heading {
-                    shown_outputs_heading = true;
-                    ui.add_space(6.0);
-                    ui.strong("Output devices (records what is playing)");
-                }
-                let key = d.key();
-                let mut on = self.settings.selected.contains(&key);
-                let label = format!(
-                    "{}   ({} · {} ch · {} Hz · {})",
-                    d.name, d.host, d.channels, d.sample_rate, d.sample_format
-                );
-                if ui.checkbox(&mut on, label).changed() {
-                    if on {
-                        self.settings.selected.insert(key);
-                    } else {
-                        self.settings.selected.remove(&key);
-                    }
-                }
+            if ui.button("Browse…").clicked()
+                && let Some(dir) = rfd::FileDialog::new()
+                    .set_directory(&self.settings.output_dir)
+                    .pick_folder()
+            {
+                self.settings.output_dir = dir.display().to_string();
+                self.rescan_sessions();
+            }
+            if ui
+                .button("Open")
+                .on_hover_text("Open the output folder")
+                .clicked()
+            {
+                self.open_folder(PathBuf::from(&self.settings.output_dir));
             }
         });
+        ui.horizontal(|ui| {
+            ui.label("Export format:");
+            for f in [ExportFormat::Flac, ExportFormat::Wav] {
+                ui.radio_value(&mut self.settings.format, f, f.label());
+            }
+        });
+        ui.add_space(6.0);
+        ui.horizontal(|ui| {
+            ui.strong("Input devices");
+            if ui.button("Refresh").clicked() {
+                self.refresh_devices();
+            }
+            ui.checkbox(&mut self.settings.only_selected, "Show only selected");
+        });
+        let visible: Vec<&InputDeviceInfo> = self
+            .devices
+            .iter()
+            .filter(|d| !self.settings.only_selected || self.settings.selected.contains(&d.key()))
+            .collect();
+        if !visible.iter().any(|d| !d.loopback) {
+            ui.weak(if self.settings.only_selected {
+                "No input devices selected."
+            } else {
+                "No input devices found."
+            });
+        }
+        let hidden = self.devices.len() - visible.len();
+        let mut toggled = None;
+        let mut shown_outputs_heading = false;
+        for d in visible {
+            if d.loopback && !shown_outputs_heading {
+                shown_outputs_heading = true;
+                ui.add_space(6.0);
+                ui.strong("Output devices (records what is playing)");
+            }
+            let key = d.key();
+            let mut on = self.settings.selected.contains(&key);
+            let label = format!(
+                "{}   ({} · {} ch · {} Hz · {})",
+                d.name, d.host, d.channels, d.sample_rate, d.sample_format
+            );
+            if ui.checkbox(&mut on, label).changed() {
+                toggled = Some((key, on));
+            }
+        }
+        if hidden > 0 {
+            ui.weak(format!("{hidden} unselected device(s) hidden"));
+        }
+        if let Some((key, on)) = toggled {
+            if on {
+                self.settings.selected.insert(key);
+            } else {
+                self.settings.selected.remove(&key);
+            }
+        }
     }
 
     fn open_folder(&mut self, path: PathBuf) {
@@ -332,7 +370,100 @@ impl MultiRecorderApp {
                 }
             }
         }
+        self.status_line(ui);
         ui.add_space(4.0);
+    }
+
+    /// Disk space, time left, RAM and load, under the record controls.
+    fn status_line(&mut self, ui: &mut egui::Ui) {
+        let stale = self
+            .resources
+            .is_none_or(|(at, _, _)| at.elapsed() >= Duration::from_secs(2));
+        if stale {
+            self.resources = Some((
+                Instant::now(),
+                resources::free_space(Path::new(&self.settings.output_dir)),
+                resources::process_ram(),
+            ));
+        }
+        let Some((_, free, ram)) = self.resources else {
+            return;
+        };
+        let format = self.settings.format;
+        // Disk rate and busiest track for what is (or would be) recorded.
+        let (rate, devices, busiest) = match &self.phase {
+            Phase::Recording(rec) => {
+                let statuses = rec.statuses();
+                let rate: f64 = statuses
+                    .iter()
+                    .map(|(m, _)| resources::track_disk_rate(m.sample_rate, m.channels, format))
+                    .sum();
+                let busiest = statuses
+                    .iter()
+                    .map(|(_, st)| st.load.max())
+                    .fold(0.0, f32::max);
+                (rate, statuses.len(), Some(busiest))
+            }
+            _ => {
+                let selected: Vec<_> = self
+                    .devices
+                    .iter()
+                    .filter(|d| self.settings.selected.contains(&d.key()))
+                    .collect();
+                let rate = selected
+                    .iter()
+                    .map(|d| resources::track_disk_rate(d.sample_rate, d.channels, format))
+                    .sum();
+                (rate, selected.len(), None)
+            }
+        };
+        let recording = busiest.is_some();
+        let left = free.and_then(|f| resources::time_left(f, rate));
+        if recording && !self.warned_low_disk && left.is_some_and(|l| l < Duration::from_secs(600))
+        {
+            self.warned_low_disk = true;
+            self.message("Low disk space: less than 10 minutes of recording left.");
+        }
+        if !recording {
+            self.warned_low_disk = false;
+        }
+
+        ui.horizontal_wrapped(|ui| {
+            ui.spacing_mut().item_spacing.x = 4.0;
+            match free {
+                Some(f) => ui.weak(format!("Disk: {} free", resources::format_bytes(f))),
+                None => ui.weak("Disk: unknown"),
+            };
+            if let Some(left) = left {
+                let color = if left < Duration::from_secs(600) {
+                    RED
+                } else if left < Duration::from_secs(3600) {
+                    ORANGE
+                } else {
+                    ui.visuals().weak_text_color()
+                };
+                let text = if recording {
+                    format!("· ~{} left", resources::format_duration(left))
+                } else {
+                    format!(
+                        "· enough for ~{} with {devices} device(s)",
+                        resources::format_duration(left)
+                    )
+                };
+                ui.colored_label(color, text).on_hover_text(
+                    "Estimate: raw capture plus the export growing beside it \
+                     (raw files are deleted when the recording is finished).",
+                );
+            }
+            if let Some(ram) = ram {
+                ui.weak(format!("· RAM: {}", resources::format_bytes(ram)));
+            }
+            if let Some(busiest) = busiest {
+                ui.weak("· Load:");
+                ui.colored_label(load_color(busiest), format!("{:.1}%", busiest * 100.0))
+                    .on_hover_text("Busiest stage of the busiest track; see the Load column.");
+            }
+        });
     }
 
     fn tracks_ui(&mut self, ui: &mut egui::Ui) {
@@ -340,10 +471,9 @@ impl MultiRecorderApp {
             return;
         };
         let statuses = rec.statuses();
-        ui.separator();
         egui::Grid::new("tracks")
             .striped(true)
-            .num_columns(7)
+            .num_columns(8)
             .show(ui, |ui| {
                 for h in [
                     "Device",
@@ -353,6 +483,7 @@ impl MultiRecorderApp {
                     "Recorded",
                     "Gaps",
                     "Reconnects",
+                    "Load",
                 ] {
                     ui.strong(h);
                 }
@@ -374,7 +505,12 @@ impl MultiRecorderApp {
                         TrackState::Stopped => ("stopped".to_string(), egui::Color32::GRAY),
                         TrackState::Failed(e) => (format!("failed: {e}"), RED),
                     };
-                    ui.colored_label(color, text);
+                    ui.allocate_ui(egui::vec2(260.0, 18.0), |ui| {
+                        ui.add(
+                            egui::Label::new(egui::RichText::new(&text).color(color)).truncate(),
+                        )
+                        .on_hover_text(&text);
+                    });
                     warnings_label(ui, &st.warnings);
                     ui.label(format!("{:.1} s", st.frames_written as f64 / rate));
                     ui.label(format!("{:.1} s", st.silence_frames as f64 / rate))
@@ -382,6 +518,7 @@ impl MultiRecorderApp {
                             "Silence inserted while the device was missing, stalled or overloaded",
                         );
                     ui.label(st.reconnects.to_string());
+                    load_label(ui, &st.load);
                     ui.end_row();
                 }
             });
@@ -471,6 +608,32 @@ fn level_meter(ui: &mut egui::Ui, levels: &[f32]) {
             .collect::<Vec<_>>()
             .join("\n"),
     );
+}
+
+fn load_color(load: f32) -> egui::Color32 {
+    if load >= 0.8 {
+        RED
+    } else if load >= 0.5 {
+        ORANGE
+    } else {
+        GREEN
+    }
+}
+
+/// Busiest stage as a percentage of one CPU core, with a breakdown on hover.
+fn load_label(ui: &mut egui::Ui, load: &Load) {
+    let pct = |f: f32| format!("{:.1}%", f * 100.0);
+    ui.colored_label(load_color(load.max()), pct(load.max()))
+        .on_hover_text(format!(
+            "Share of real time each stage needs on one CPU core.\n\
+             100% = barely keeping up.\n\n\
+             Audio callback: {}  (hard real-time deadline)\n\
+             Writer: {}  (disk writes + analysis; 4 s buffer)\n\
+             Live export: {}  (if it falls behind, Stop takes longer)",
+            pct(load.callback),
+            pct(load.writer),
+            pct(load.export)
+        ));
 }
 
 fn warnings_label(ui: &mut egui::Ui, w: &Warnings) {
@@ -585,9 +748,12 @@ impl eframe::App for MultiRecorderApp {
                 .id_salt("main")
                 .auto_shrink([false, false])
                 .show(ui, |ui| {
-                    self.settings_ui(ui);
-                    self.tracks_ui(ui);
-                    self.unexported_ui(ui);
+                    if matches!(self.phase, Phase::Idle) {
+                        self.settings_ui(ui);
+                        self.unexported_ui(ui);
+                    } else {
+                        self.tracks_ui(ui);
+                    }
                 });
         });
 

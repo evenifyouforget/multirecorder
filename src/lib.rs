@@ -5,4 +5,5 @@ pub mod app;
 pub mod audio;
 pub mod export;
 pub mod recorder;
+pub mod resources;
 pub mod session;

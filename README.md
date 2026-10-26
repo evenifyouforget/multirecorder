@@ -10,11 +10,16 @@ CoreAudio on macOS, ALSA on Linux) and [egui](https://github.com/emilk/egui).
 
 1. Pick an output folder and export format (FLAC 24-bit or WAV 32-bit float).
 2. Tick the devices to record, press **Record**. Besides inputs, output devices
-   (speakers, headphones) can be recorded via loopback on Windows and macOS 14.6+.
-3. Watch the level meters and the **Warnings** column while recording.
+   (speakers, headphones) can be recorded via loopback on Windows and macOS 14.6+;
+   while nothing is playing, a loopback track is filled with silence.
+   **Show only selected** hides the devices you aren't using.
+3. Watch the level meters and the **Warnings** column while recording. The top
+   bar shows free disk space, roughly how much recording time it allows, the
+   app's memory use and the busiest track's load.
 4. Press **Stop**. Each device is exported to
    `<output folder>/session-YYYYMMDD-HHMMSS/NN-<device>.flac|wav`.
-   **Open last session** shows the files.
+   Export runs alongside the recording, so Stop finishes in seconds even after
+   hours. **Open last session** shows the files.
 
 Each device records at its own native sample rate and channel count.
 
@@ -30,6 +35,10 @@ Each device records at its own native sample rate and channel count.
 The top bar shows how many tracks need attention, and every warning is written
 to `session.log` in the session folder.
 
+The **Load** column shows how busy each track's audio callback, disk writer and
+exporter are (busiest of the three). Values near 100% mean the computer can't
+keep up and gaps are likely.
+
 ## Reliability
 
 - Every device records on its own thread into its own file; one failing device
@@ -40,6 +49,9 @@ to `session.log` in the session folder.
 - Audio is captured to headerless raw files (`*.f32`) flushed to disk every
   second, so a crash loses at most about a second. Interrupted sessions are
   listed at startup and can be exported from there.
+- The export is written alongside the raw file and finished with a rename; the
+  raw file is deleted only once its export is safely on disk. If an export
+  fails, the raw file is kept and exported again after Stop.
 - A 4-second buffer per device absorbs slow disk writes.
 - Recording runs independently of the window (minimizing is fine).
 - Every event (disconnects, reconnects, gaps) is written to `session.log` in the

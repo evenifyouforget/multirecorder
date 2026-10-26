@@ -149,6 +149,7 @@ fn test_config() -> RecorderConfig {
         flush_interval: Duration::from_millis(100),
         poll_interval: Duration::from_millis(5),
         idle_gap: Duration::from_millis(100),
+        live_export: None,
     }
 }
 
@@ -493,4 +494,112 @@ fn quiet_loopback_is_padded_not_reconnected() {
         / 48_000.0
         + 1.2;
     assert!((1.45..1.7).contains(&resumed), "audio resumes at {resumed}");
+}
+
+fn live_config(format: ExportFormat) -> RecorderConfig {
+    RecorderConfig {
+        live_export: Some(format),
+        ..test_config()
+    }
+}
+
+#[test]
+fn live_export_runs_during_recording_and_matches_timeline() {
+    for format in [ExportFormat::Wav, ExportFormat::Flac] {
+        let root = tempfile::tempdir().unwrap();
+        let ok = Control::new(Mode::Ok);
+        let flaky = Control::new(Mode::Ok);
+        let rec = Recorder::start(
+            root.path(),
+            vec![
+                spec("a", &ok, 48_000, 2, 0.5),
+                spec("b", &flaky, 44_100, 1, 0.25),
+            ],
+            live_config(format),
+        )
+        .unwrap();
+        thread::sleep(Duration::from_millis(500));
+        flaky.set(Mode::Gone);
+        thread::sleep(Duration::from_millis(400));
+        flaky.set(Mode::Ok);
+        thread::sleep(Duration::from_millis(600));
+
+        // Export is already under way while recording, a little behind real time.
+        for (meta, st) in rec.statuses() {
+            let behind =
+                (st.frames_written - st.exported_frames) as f64 / f64::from(meta.sample_rate);
+            assert!(st.exported_frames > 0 && behind < 0.5, "{format:?} {st:?}");
+            // Load is measured for every stage and is far from saturated.
+            let l = st.load;
+            assert!(
+                l.callback > 0.0 && l.writer > 0.0 && l.export > 0.0,
+                "{l:?}"
+            );
+            assert!(l.max() < 0.5, "{l:?}");
+        }
+
+        let mut last = -1.0f32;
+        let (dir, meta) = rec
+            .stop_with_progress(Duration::from_secs(5), &mut |p| {
+                assert!(p >= last && p <= 1.0);
+                last = p;
+            })
+            .unwrap();
+        assert_eq!(last, 1.0);
+        for t in &meta.tracks {
+            assert!(
+                !dir.join(&t.raw_file).exists(),
+                "raw removed after live export"
+            );
+        }
+        let outs = export_session(&dir, format, &mut |_| {}).unwrap();
+        assert_eq!(outs.len(), 2);
+        assert_eq!(
+            SessionMeta::load(&dir).unwrap().state,
+            SessionState::Exported
+        );
+
+        // Equal duration on the shared timeline despite different rates and a gap.
+        let secs: Vec<f64> = outs
+            .iter()
+            .map(|p| match format {
+                ExportFormat::Wav => {
+                    let r = hound::WavReader::open(p).unwrap();
+                    f64::from(r.duration()) / f64::from(r.spec().sample_rate)
+                }
+                ExportFormat::Flac => {
+                    let r = claxon::FlacReader::open(p).unwrap();
+                    let i = r.streaminfo();
+                    i.samples.unwrap() as f64 / f64::from(i.sample_rate)
+                }
+            })
+            .collect();
+        assert!((secs[0] - secs[1]).abs() < 0.001, "{format:?} {secs:?}");
+        assert!(secs[0] > 1.3, "{secs:?}");
+    }
+}
+
+#[test]
+fn failed_live_export_falls_back_to_raw_capture() {
+    // FLAC can't hold 10 channels, so the live export fails immediately.
+    let root = tempfile::tempdir().unwrap();
+    let ok = Control::new(Mode::Ok);
+    let rec = Recorder::start(
+        root.path(),
+        vec![spec("wide", &ok, 48_000, 10, 0.5)],
+        live_config(ExportFormat::Flac),
+    )
+    .unwrap();
+    thread::sleep(Duration::from_millis(400));
+    let (dir, meta) = rec.stop(Duration::from_secs(5)).unwrap();
+    assert!(dir.join(&meta.tracks[0].raw_file).exists(), "raw kept");
+    assert_eq!(meta.state, SessionState::Stopped);
+    let log = std::fs::read_to_string(dir.join(session::LOG_FILE)).unwrap();
+    assert!(log.contains("exporting from the raw capture"), "{log}");
+    // The recording itself is unaffected and exports normally to WAV.
+    let outs = export_session(&dir, ExportFormat::Wav, &mut |_| {}).unwrap();
+    assert_eq!(
+        hound::WavReader::open(&outs[0]).unwrap().spec().channels,
+        10
+    );
 }
