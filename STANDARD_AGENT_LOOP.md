@@ -62,8 +62,13 @@ Priority order, following PROBLEM_STATEMENT.md ("reliability is king"):
   loopback, performance on the tester's machine) as unchecked PR test items.
 
 ## 6. Close the loop
+- Before pushing more commits to an existing PR, check it isn't already
+  merged (`gh pr view N --json state`). Commits pushed after a merge never
+  reach `main`; they need a new PR.
 - Push, open or update the PR (summary, closing keywords, test plan) and
   wait for CI on all five checks.
+- Before closing issues as fixed, confirm the fix is on `main`
+  (`git show origin/main:<file>`), not just on a branch.
 - Reply on issues with a diagnosis, workaround or plan, signed
   "— Claude (AI assistant), on behalf of the maintainer".
 - Close issues fixed by merged PRs that weren't auto-closed.
