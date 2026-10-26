@@ -159,6 +159,7 @@ impl Recorder {
                 File::create(&path).with_context(|| format!("creating {}", path.display()))
             })
             .collect::<Result<Vec<_>>>()?;
+        session::sync_dir(&dir);
 
         log.line(&format!("recording started in {}", dir.display()));
         let start = Instant::now();

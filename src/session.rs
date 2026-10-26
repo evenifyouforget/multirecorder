@@ -88,6 +88,7 @@ impl SessionMeta {
         f.sync_all()?;
         drop(f);
         fs::rename(&tmp, dir.join(META_FILE)).context("replacing session.json")?;
+        sync_dir(dir);
         Ok(())
     }
 }
@@ -134,12 +135,29 @@ pub fn create_session_dir(root: &Path) -> Result<PathBuf> {
         };
         let dir = root.join(name);
         match fs::create_dir(&dir) {
-            Ok(()) => return Ok(dir),
+            Ok(()) => {
+                sync_dir(root);
+                return Ok(dir);
+            }
             Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
             Err(e) => return Err(e).with_context(|| format!("creating {}", dir.display())),
         }
     }
     unreachable!()
+}
+
+/// Makes file creations, renames and deletions in `dir` survive a power cut.
+/// Syncing a file only covers its contents; on Linux and macOS the directory
+/// entry pointing at it needs its own sync. NTFS journals directory changes,
+/// and Windows can't open a directory as a file, so this does nothing there.
+/// Best effort: some filesystems refuse to sync directories.
+pub fn sync_dir(dir: &Path) {
+    #[cfg(unix)]
+    if let Err(e) = File::open(dir).and_then(|d| d.sync_all()) {
+        log::warn!("cannot sync directory {}: {e}", dir.display());
+    }
+    #[cfg(not(unix))]
+    let _ = dir;
 }
 
 /// Sessions under `root` that still have raw captures waiting to be exported,

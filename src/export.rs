@@ -239,6 +239,10 @@ impl TrackEncoder {
         drop(file);
         fs::rename(&self.tmp, &self.out)
             .with_context(|| format!("renaming to {}", self.out.display()))?;
+        // The export must be durable before its raw capture is deleted.
+        if let Some(dir) = self.out.parent() {
+            crate::session::sync_dir(dir);
+        }
         Ok(self.out)
     }
 }
@@ -686,5 +690,47 @@ mod tests {
         let (_root, dir, _) = make_session(1, 48_000, &[]);
         let outs = export_session(&dir, ExportFormat::Flac, &mut |_| {}).unwrap();
         assert!(outs[0].exists());
+    }
+
+    /// The state a crash or power cut leaves mid-recording with live export:
+    /// one track's export half-written (stale `.partial`, raw ending in a torn
+    /// frame), another track already exported and its raw deleted. Recovery
+    /// must find the session, export from the raw and keep the finished track.
+    #[test]
+    fn recovers_session_interrupted_during_live_export() {
+        let samples = sine(4_800, 2, 48_000);
+        let (root, dir, first) = make_session(2, 48_000, &samples);
+        let raw = dir.join(&first.raw_file);
+        let mut torn = fs::read(&raw).unwrap();
+        torn.extend_from_slice(&0.1f32.to_le_bytes());
+        fs::write(&raw, torn).unwrap();
+        let out = output_path(&dir, &first, ExportFormat::Wav);
+        fs::write(out.with_extension("wav.partial"), b"RIFF garbage").unwrap();
+
+        let second = TrackMeta {
+            raw_file: raw_file_name(1, "Other Mic"),
+            ..first.clone()
+        };
+        let done = output_path(&dir, &second, ExportFormat::Wav);
+        fs::write(&done, b"already exported").unwrap();
+        let meta = SessionMeta::new(vec![first, second]);
+        assert_eq!(meta.state, SessionState::Recording);
+        meta.save(&dir).unwrap();
+
+        let found = crate::session::find_unexported_sessions(root.path());
+        assert_eq!(found.len(), 1);
+        let outs = export_session(&dir, ExportFormat::Wav, &mut |_| {}).unwrap();
+        assert_eq!(outs, vec![out.clone(), done.clone()]);
+        let r = hound::WavReader::open(&out).unwrap();
+        let got: Vec<f32> = r.into_samples().map(|s| s.unwrap()).collect();
+        assert_eq!(got, samples, "torn frame dropped, audio intact");
+        assert_eq!(fs::read(&done).unwrap(), b"already exported");
+        assert!(!out.with_extension("wav.partial").exists());
+        assert!(!raw.exists());
+        assert_eq!(
+            SessionMeta::load(&dir).unwrap().state,
+            SessionState::Exported
+        );
+        assert!(crate::session::find_unexported_sessions(root.path()).is_empty());
     }
 }
