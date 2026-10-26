@@ -141,7 +141,10 @@ impl MultiRecorderApp {
         match Recorder::start(
             Path::new(&self.settings.output_dir),
             specs,
-            RecorderConfig::default(),
+            RecorderConfig {
+                live_export: Some(self.settings.format),
+                ..RecorderConfig::default()
+            },
         ) {
             Ok(rec) => {
                 self.message(format!("Recording to {}", rec.dir().display()));
@@ -162,9 +165,15 @@ impl MultiRecorderApp {
         }));
         let format = self.settings.format;
         spawn_job(job.clone(), ctx.clone(), move |job| {
+            let mut progress = |p: f32| {
+                let mut j = job.lock().expect("job lock");
+                j.text = "Finishing export…".into();
+                j.progress = p;
+            };
             let (dir, _) = rec
-                .stop(Duration::from_secs(5))
+                .stop_with_progress(Duration::from_secs(5), &mut progress)
                 .map_err(|e| format!("{e:#}"))?;
+            // Picks up any track whose live export failed.
             run_export(&dir, format, job)
         });
         self.phase = Phase::Finishing(job);
