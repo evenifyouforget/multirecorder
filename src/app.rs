@@ -22,10 +22,14 @@ const RED: egui::Color32 = egui::Color32::from_rgb(210, 60, 60);
 const MAX_MESSAGES: usize = 200;
 
 #[derive(Serialize, Deserialize)]
+// Fields added later fall back to defaults instead of discarding saved settings.
+#[serde(default)]
 struct Settings {
     output_dir: String,
     format: ExportFormat,
     selected: BTreeSet<String>,
+    /// Hide devices that are not ticked.
+    only_selected: bool,
 }
 
 impl Default for Settings {
@@ -37,6 +41,7 @@ impl Default for Settings {
             output_dir: base.join("multirecorder").display().to_string(),
             format: ExportFormat::Flac,
             selected: BTreeSet::new(),
+            only_selected: false,
         }
     }
 }
@@ -175,72 +180,89 @@ impl MultiRecorderApp {
         self.phase = Phase::Finishing(job);
     }
 
+    /// Output folder, format and device picker. Only shown while idle: none of
+    /// it can change during a recording, and hiding it keeps the meters in view.
     fn settings_ui(&mut self, ui: &mut egui::Ui) {
-        let idle = matches!(self.phase, Phase::Idle);
-        ui.add_enabled_ui(idle, |ui| {
-            ui.horizontal(|ui| {
-                ui.label("Output folder:");
-                let edit = ui.add(
-                    egui::TextEdit::singleline(&mut self.settings.output_dir)
-                        .desired_width(ui.available_width() - 160.0),
-                );
-                if edit.lost_focus() {
-                    self.rescan_sessions();
-                }
-                if ui.button("Browse…").clicked()
-                    && let Some(dir) = rfd::FileDialog::new()
-                        .set_directory(&self.settings.output_dir)
-                        .pick_folder()
-                {
-                    self.settings.output_dir = dir.display().to_string();
-                    self.rescan_sessions();
-                }
-                if ui
-                    .button("Open")
-                    .on_hover_text("Open the output folder")
-                    .clicked()
-                {
-                    self.open_folder(PathBuf::from(&self.settings.output_dir));
-                }
-            });
-            ui.horizontal(|ui| {
-                ui.label("Export format:");
-                for f in [ExportFormat::Flac, ExportFormat::Wav] {
-                    ui.radio_value(&mut self.settings.format, f, f.label());
-                }
-            });
-            ui.add_space(6.0);
-            ui.horizontal(|ui| {
-                ui.strong("Input devices");
-                if ui.button("Refresh").clicked() {
-                    self.refresh_devices();
-                }
-            });
-            if !self.devices.iter().any(|d| !d.loopback) {
-                ui.label("No input devices found.");
+        ui.horizontal(|ui| {
+            ui.label("Output folder:");
+            let edit = ui.add(
+                egui::TextEdit::singleline(&mut self.settings.output_dir)
+                    .desired_width(ui.available_width() - 160.0),
+            );
+            if edit.lost_focus() {
+                self.rescan_sessions();
             }
-            let mut shown_outputs_heading = false;
-            for d in &self.devices {
-                if d.loopback && !shown_outputs_heading {
-                    shown_outputs_heading = true;
-                    ui.add_space(6.0);
-                    ui.strong("Output devices (records what is playing)");
-                }
-                let key = d.key();
-                let mut on = self.settings.selected.contains(&key);
-                let label = format!(
-                    "{}   ({} · {} ch · {} Hz · {})",
-                    d.name, d.host, d.channels, d.sample_rate, d.sample_format
-                );
-                if ui.checkbox(&mut on, label).changed() {
-                    if on {
-                        self.settings.selected.insert(key);
-                    } else {
-                        self.settings.selected.remove(&key);
-                    }
-                }
+            if ui.button("Browse…").clicked()
+                && let Some(dir) = rfd::FileDialog::new()
+                    .set_directory(&self.settings.output_dir)
+                    .pick_folder()
+            {
+                self.settings.output_dir = dir.display().to_string();
+                self.rescan_sessions();
+            }
+            if ui
+                .button("Open")
+                .on_hover_text("Open the output folder")
+                .clicked()
+            {
+                self.open_folder(PathBuf::from(&self.settings.output_dir));
             }
         });
+        ui.horizontal(|ui| {
+            ui.label("Export format:");
+            for f in [ExportFormat::Flac, ExportFormat::Wav] {
+                ui.radio_value(&mut self.settings.format, f, f.label());
+            }
+        });
+        ui.add_space(6.0);
+        ui.horizontal(|ui| {
+            ui.strong("Input devices");
+            if ui.button("Refresh").clicked() {
+                self.refresh_devices();
+            }
+            ui.checkbox(&mut self.settings.only_selected, "Show only selected");
+        });
+        let visible: Vec<&InputDeviceInfo> = self
+            .devices
+            .iter()
+            .filter(|d| !self.settings.only_selected || self.settings.selected.contains(&d.key()))
+            .collect();
+        if !visible.iter().any(|d| !d.loopback) {
+            ui.weak(if self.settings.only_selected {
+                "No input devices selected."
+            } else {
+                "No input devices found."
+            });
+        }
+        let hidden = self.devices.len() - visible.len();
+        let mut toggled = None;
+        let mut shown_outputs_heading = false;
+        for d in visible {
+            if d.loopback && !shown_outputs_heading {
+                shown_outputs_heading = true;
+                ui.add_space(6.0);
+                ui.strong("Output devices (records what is playing)");
+            }
+            let key = d.key();
+            let mut on = self.settings.selected.contains(&key);
+            let label = format!(
+                "{}   ({} · {} ch · {} Hz · {})",
+                d.name, d.host, d.channels, d.sample_rate, d.sample_format
+            );
+            if ui.checkbox(&mut on, label).changed() {
+                toggled = Some((key, on));
+            }
+        }
+        if hidden > 0 {
+            ui.weak(format!("{hidden} unselected device(s) hidden"));
+        }
+        if let Some((key, on)) = toggled {
+            if on {
+                self.settings.selected.insert(key);
+            } else {
+                self.settings.selected.remove(&key);
+            }
+        }
     }
 
     fn open_folder(&mut self, path: PathBuf) {
@@ -340,7 +362,6 @@ impl MultiRecorderApp {
             return;
         };
         let statuses = rec.statuses();
-        ui.separator();
         egui::Grid::new("tracks")
             .striped(true)
             .num_columns(7)
@@ -590,9 +611,12 @@ impl eframe::App for MultiRecorderApp {
                 .id_salt("main")
                 .auto_shrink([false, false])
                 .show(ui, |ui| {
-                    self.settings_ui(ui);
-                    self.tracks_ui(ui);
-                    self.unexported_ui(ui);
+                    if matches!(self.phase, Phase::Idle) {
+                        self.settings_ui(ui);
+                        self.unexported_ui(ui);
+                    } else {
+                        self.tracks_ui(ui);
+                    }
                 });
         });
 
