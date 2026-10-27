@@ -5,6 +5,7 @@
 //! measured in frames, so the analysis is deterministic and testable.
 
 use std::collections::VecDeque;
+use std::time::{Duration, Instant};
 
 /// Dropouts are runs of exact digital zero between pieces of live audio. Real
 /// analog inputs essentially never produce exact zeros, so short zero runs are a
@@ -193,6 +194,57 @@ impl Analyzer {
     }
 }
 
+/// Peak level per fixed slice of wall-clock time over the last minute, for the
+/// history strip. Wall-clock (not frames) so gaps the device didn't deliver
+/// show up as silence, like they do in the recording.
+#[derive(Clone, Debug)]
+pub struct LevelHistory {
+    slices: VecDeque<f32>,
+    current: f32,
+    slice_start: Instant,
+}
+
+impl LevelHistory {
+    pub const SLICE: Duration = Duration::from_millis(500);
+    pub const LEN: usize = 120;
+
+    pub fn new(now: Instant) -> Self {
+        Self {
+            slices: VecDeque::with_capacity(Self::LEN),
+            current: 0.0,
+            slice_start: now,
+        }
+    }
+
+    /// Adds the peak of audio that arrived up to `now`. Returns true when one
+    /// or more slices completed, i.e. the strip changed.
+    pub fn add(&mut self, now: Instant, peak: f32) -> bool {
+        self.current = self.current.max(peak);
+        let mut changed = false;
+        // After a long pause, start over instead of filling slice by slice.
+        if now.duration_since(self.slice_start) > Self::SLICE * Self::LEN as u32 {
+            self.slices.clear();
+            self.slice_start = now;
+            changed = true;
+        }
+        while now.duration_since(self.slice_start) >= Self::SLICE {
+            if self.slices.len() == Self::LEN {
+                self.slices.pop_front();
+            }
+            self.slices.push_back(self.current);
+            self.current = 0.0;
+            self.slice_start += Self::SLICE;
+            changed = true;
+        }
+        changed
+    }
+
+    /// Completed slices, oldest first.
+    pub fn slices(&self) -> impl Iterator<Item = f32> + '_ {
+        self.slices.iter().copied()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -322,5 +374,37 @@ mod tests {
         assert!(w.no_signal && !w.any_problem());
         a.process(&tone(100, 1, 0.5));
         assert!(!a.warnings().no_signal);
+    }
+
+    #[test]
+    fn level_history_keeps_peak_per_slice_for_a_minute() {
+        let t0 = Instant::now();
+        let mut h = LevelHistory::new(t0);
+        let at = |ms: u64| t0 + Duration::from_millis(ms);
+        assert!(!h.add(at(100), 0.2));
+        assert!(!h.add(at(400), 0.5));
+        // Audio reported at 600 ms arrived mostly before 500 ms: slice 0.
+        assert!(h.add(at(600), 0.1));
+        assert_eq!(h.slices().collect::<Vec<_>>(), vec![0.5]);
+        assert!(!h.add(at(900), 0.3));
+        // Nothing arrives for 1.2 s: those slices are silent.
+        assert!(h.add(at(2_100), 0.0));
+        assert_eq!(h.slices().collect::<Vec<_>>(), vec![0.5, 0.3, 0.0, 0.0]);
+        // Only the last minute is kept.
+        for i in 0..200 {
+            h.add(at(2_100 + i * 500), 0.3);
+        }
+        assert_eq!(h.slices().count(), LevelHistory::LEN);
+        assert!(h.slices().all(|p| p == 0.3));
+    }
+
+    #[test]
+    fn level_history_skips_ahead_after_a_long_pause() {
+        let t0 = Instant::now();
+        let mut h = LevelHistory::new(t0);
+        assert!(h.add(t0 + Duration::from_secs(3_600), 0.4));
+        assert_eq!(h.slices().count(), 0);
+        h.add(t0 + Duration::from_millis(3_600_600), 0.0);
+        assert_eq!(h.slices().last(), Some(0.4));
     }
 }

@@ -9,7 +9,7 @@ use std::time::{Duration, Instant};
 use eframe::egui;
 use serde::{Deserialize, Serialize};
 
-use crate::analysis::Warnings;
+use crate::analysis::{LevelHistory, Warnings};
 use crate::audio::{self, CpalSource, InputDeviceInfo};
 use crate::export::{self, ExportFormat};
 use crate::recorder::{Load, Recorder, RecorderConfig, TrackSpec, TrackState, TrackStatus};
@@ -473,11 +473,12 @@ impl MultiRecorderApp {
         let statuses = rec.statuses();
         egui::Grid::new("tracks")
             .striped(true)
-            .num_columns(8)
+            .num_columns(9)
             .show(ui, |ui| {
                 for h in [
                     "Device",
                     "Level",
+                    "Last minute",
                     "Status",
                     "Warnings",
                     "Recorded",
@@ -495,6 +496,7 @@ impl MultiRecorderApp {
                             .on_hover_text(&meta.device_name);
                     });
                     level_meter(ui, &st.levels);
+                    level_history(ui, &st.history);
                     let (text, color) = match &st.state {
                         TrackState::Starting => ("starting".to_string(), egui::Color32::GRAY),
                         TrackState::Recording if st.idle => {
@@ -583,22 +585,13 @@ fn level_meter(ui: &mut egui::Ui, levels: &[f32]) {
     let (rect, response) = ui.allocate_exact_size(size, egui::Sense::hover());
     let painter = ui.painter();
     painter.rect_filled(rect, 2.0, ui.visuals().extreme_bg_color);
-    let db = |l: f32| 20.0 * l.max(1e-6).log10();
     for (i, &level) in levels.iter().enumerate() {
-        let frac = ((db(level) + 60.0) / 60.0).clamp(0.0, 1.0);
-        let color = if level >= 0.999 {
-            RED
-        } else if db(level) > -6.0 {
-            ORANGE
-        } else {
-            GREEN
-        };
         let top = rect.top() + i as f32 * (bar + 1.0);
         let fill = egui::Rect::from_min_size(
             egui::pos2(rect.left(), top),
-            egui::vec2(rect.width() * frac, bar),
+            egui::vec2(rect.width() * meter_fraction(level), bar),
         );
-        painter.rect_filled(fill, 1.0, color);
+        painter.rect_filled(fill, 1.0, level_color(level));
     }
     response.on_hover_text(
         levels
@@ -608,6 +601,56 @@ fn level_meter(ui: &mut egui::Ui, levels: &[f32]) {
             .collect::<Vec<_>>()
             .join("\n"),
     );
+}
+
+/// Peak level over the last minute, newest on the right. Mirrored like a
+/// waveform, but on the meters' -60..0 dBFS scale so quiet sources stay visible.
+fn level_history(ui: &mut egui::Ui, history: &[f32]) {
+    let (rect, response) = ui.allocate_exact_size(egui::vec2(180.0, 18.0), egui::Sense::hover());
+    let painter = ui.painter();
+    painter.rect_filled(rect, 2.0, ui.visuals().extreme_bg_color);
+    let mid = rect.center().y;
+    painter.hline(
+        rect.x_range(),
+        mid,
+        egui::Stroke::new(1.0, ui.visuals().faint_bg_color),
+    );
+    let step = rect.width() / LevelHistory::LEN as f32;
+    for (i, &peak) in history.iter().rev().take(LevelHistory::LEN).enumerate() {
+        let half = (rect.height() / 2.0 - 1.0) * meter_fraction(peak);
+        if half <= 0.0 {
+            continue;
+        }
+        let right = rect.right() - i as f32 * step;
+        let slice = egui::Rect::from_min_max(
+            egui::pos2(right - step, mid - half.max(0.5)),
+            egui::pos2(right, mid + half.max(0.5)),
+        );
+        painter.rect_filled(slice, 0.0, level_color(peak));
+    }
+    response.on_hover_text(
+        "Peak level over the last minute, newest on the right (-60 to 0 dBFS). \
+         A flat line means nothing above -60 dBFS arrived.",
+    );
+}
+
+fn db(level: f32) -> f32 {
+    20.0 * level.max(1e-6).log10()
+}
+
+/// Position of a linear peak level on the -60..0 dBFS meter scale.
+fn meter_fraction(level: f32) -> f32 {
+    ((db(level) + 60.0) / 60.0).clamp(0.0, 1.0)
+}
+
+fn level_color(level: f32) -> egui::Color32 {
+    if level >= 0.999 {
+        RED
+    } else if db(level) > -6.0 {
+        ORANGE
+    } else {
+        GREEN
+    }
 }
 
 fn load_color(load: f32) -> egui::Color32 {
