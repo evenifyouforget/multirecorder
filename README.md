@@ -26,7 +26,9 @@ choose **Open** the first time. The Linux build needs ALSA (`libasound2`).
    (speakers, headphones) can be recorded via loopback on Windows and macOS 14.6+;
    while nothing is playing, a loopback track is filled with silence.
    **Show only selected** hides the devices you aren't using.
-3. Watch the level meters and the **Warnings** column while recording. The top
+3. Watch the level meters and the **Warnings** column while recording. The
+   **Last minute** strip shows each track's level over the past 60 seconds, so a
+   device that stopped receiving audio stands out as a flat line. The top
    bar shows free disk space, roughly how much recording time it allows, the
    app's memory use and the busiest track's load.
 4. Press **Stop**. Each device is exported to
