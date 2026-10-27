@@ -57,3 +57,42 @@ jobs:
         with:
           name: multirecorder-windows-gnu
           path: target/x86_64-pc-windows-gnu/release/multirecorder.exe
+
+  # Public download links that need no GitHub login and don't expire: every push
+  # to main replaces the files of the "dev" pre-release and moves its tag.
+  dev-release:
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    needs: [lint, test, cross-windows]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    concurrency:
+      group: dev-release
+      cancel-in-progress: true
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+      - name: Package
+        run: |
+          mkdir dist
+          cp artifacts/multirecorder-windows-gnu/multirecorder.exe dist/multirecorder-windows.exe
+          # Artifacts lose the executable bit; tar keeps it for users.
+          for os in Linux macOS; do
+            chmod +x "artifacts/multirecorder-$os/multirecorder"
+            tar -czf "dist/multirecorder-${os,,}.tar.gz" -C "artifacts/multirecorder-$os" multirecorder
+          done
+          ls -l dist
+      - name: Update dev pre-release
+        run: |
+          notes="Development build of $GITHUB_SHA ($(date -u '+%Y-%m-%d %H:%M UTC')), updated on every change to main. Not tested beyond CI; tested versions are the numbered releases."
+          if gh release view dev >/dev/null 2>&1; then
+            gh api -X PATCH "repos/$GH_REPO/git/refs/tags/dev" -f sha="$GITHUB_SHA" -F force=true
+            gh release upload dev dist/* --clobber
+            gh release edit dev --prerelease --title "Development build" --notes "$notes"
+          else
+            gh release create dev dist/* --prerelease --target "$GITHUB_SHA" --title "Development build" --notes "$notes"
+          fi

@@ -9,7 +9,7 @@ fn run(renderer: Renderer) -> eframe::Result {
         renderer,
         viewport: eframe::egui::ViewportBuilder::default()
             .with_title("MultiRecorder")
-            .with_inner_size([760.0, 560.0]),
+            .with_inner_size([960.0, 560.0]),
         ..Default::default()
     };
     eframe::run_native(

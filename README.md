@@ -6,6 +6,19 @@ simultaneously, exported as separate WAV or FLAC files.
 Built with Rust, [cpal](https://github.com/RustAudio/cpal) (WASAPI on Windows,
 CoreAudio on macOS, ALSA on Linux) and [egui](https://github.com/emilk/egui).
 
+## Download
+
+- Tested versions: [Releases](https://github.com/evenifyouforget/multirecorder/releases).
+- Latest development build, updated on every change to `main` and checked only by
+  the automated tests:
+  [Windows](https://github.com/evenifyouforget/multirecorder/releases/download/dev/multirecorder-windows.exe) ·
+  [macOS (Apple silicon)](https://github.com/evenifyouforget/multirecorder/releases/download/dev/multirecorder-macos.tar.gz) ·
+  [Linux (x86_64)](https://github.com/evenifyouforget/multirecorder/releases/download/dev/multirecorder-linux.tar.gz)
+
+The builds aren't code-signed. On Windows, SmartScreen may say "Windows protected
+your PC": choose **More info → Run anyway**. On macOS, right-click the app and
+choose **Open** the first time. The Linux build needs ALSA (`libasound2`).
+
 ## Using it
 
 1. Pick an output folder and export format (FLAC 24-bit or WAV 32-bit float).
@@ -13,7 +26,9 @@ CoreAudio on macOS, ALSA on Linux) and [egui](https://github.com/emilk/egui).
    (speakers, headphones) can be recorded via loopback on Windows and macOS 14.6+;
    while nothing is playing, a loopback track is filled with silence.
    **Show only selected** hides the devices you aren't using.
-3. Watch the level meters and the **Warnings** column while recording. The top
+3. Watch the level meters and the **Warnings** column while recording. The
+   **Last minute** strip shows each track's level over the past 60 seconds, so a
+   device that stopped receiving audio stands out as a flat line. The top
    bar shows free disk space, roughly how much recording time it allows, the
    app's memory use and the busiest track's load.
 4. Press **Stop**. Each device is exported to

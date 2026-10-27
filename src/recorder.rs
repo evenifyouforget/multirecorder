@@ -19,7 +19,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 
-use crate::analysis::{Analyzer, Warnings};
+use crate::analysis::{Analyzer, LevelHistory, Warnings};
 use crate::audio::{ActiveStream, InputSource, StreamEvent, StreamSink};
 use crate::export::{ExportFormat, LiveExport, LiveExportControl};
 use crate::session::{self, SessionLog, SessionMeta, SessionState, TrackMeta};
@@ -81,6 +81,8 @@ pub struct TrackStatus {
     pub load: Load,
     /// Per-channel meter level (linear peak with decay), for display.
     pub levels: Vec<f32>,
+    /// Peak of all channels per slice over the last minute, oldest first.
+    pub history: Vec<f32>,
     pub warnings: Warnings,
 }
 
@@ -182,6 +184,7 @@ impl Recorder {
                 exported_frames: 0,
                 load: Load::default(),
                 levels: vec![0.0; usize::from(meta.channels)],
+                history: Vec::new(),
                 warnings: Warnings::default(),
             }));
             // Export runs beside the recording; if it can't start, the track is
@@ -497,6 +500,7 @@ impl TrackWorker {
         let mut warnings = Warnings::default();
         let mut levels = vec![0.0f32; usize::from(self.channels)];
         let mut last_meter = Instant::now();
+        let mut history = LevelHistory::new(last_meter);
         let mut idle = false;
         let callback_busy = Arc::new(AtomicU64::new(0));
         let mut writer_busy = Duration::ZERO;
@@ -672,9 +676,11 @@ impl TrackWorker {
             // Meters fall by 20 dB per second after a peak.
             let decay = 10f32.powf(-now.duration_since(last_meter).as_secs_f32());
             last_meter = now;
-            for (level, peak) in levels.iter_mut().zip(analyzer.take_peaks()) {
+            let peaks = analyzer.take_peaks();
+            for (level, &peak) in levels.iter_mut().zip(&peaks) {
                 *level = peak.max(*level * decay);
             }
+            let history_changed = history.add(now, peaks.iter().copied().fold(0.0, f32::max));
             let current = analyzer.warnings();
             self.log_warning_changes(&warnings, &current);
             warnings = current;
@@ -683,6 +689,10 @@ impl TrackWorker {
                 st.frames_written = self.writer.frames();
                 st.silence_frames = silence;
                 st.levels.clone_from(&levels);
+                if history_changed {
+                    st.history.clear();
+                    st.history.extend(history.slices());
+                }
                 st.idle = idle;
                 st.load = load;
                 if let Some(e) = &self.export {
