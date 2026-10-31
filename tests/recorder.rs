@@ -164,6 +164,15 @@ fn read_raw(path: &std::path::Path) -> Vec<f32> {
         .collect()
 }
 
+/// Recorder tests run one at a time. Each starts several tracks whose threads
+/// wake every few milliseconds; run in parallel on a 3-4 core CI machine they
+/// starve each other, so tracks fall behind real time and timing checks fail.
+fn serial() -> std::sync::MutexGuard<'static, ()> {
+    static LOCK: Mutex<()> = Mutex::new(());
+    // A failed test poisons the lock; the others should still run.
+    LOCK.lock().unwrap_or_else(|e| e.into_inner())
+}
+
 /// Seconds since the session started. Tests compare positions on the timeline
 /// with these measured times rather than with sleep durations, because busy CI
 /// machines can oversleep by hundreds of milliseconds.
@@ -181,6 +190,7 @@ fn seconds_of_silence(samples: &[f32], channels: u16, rate: u32) -> f64 {
 
 #[test]
 fn mixed_formats_stay_aligned() {
+    let _serial = serial();
     let root = tempfile::tempdir().unwrap();
     let ok = Control::new(Mode::Ok);
     let rec = Recorder::start(
@@ -221,6 +231,7 @@ fn mixed_formats_stay_aligned() {
 
 #[test]
 fn disconnect_and_reconnect_is_padded_with_silence() {
+    let _serial = serial();
     let root = tempfile::tempdir().unwrap();
     let steady = Control::new(Mode::Ok);
     let flaky = Control::new(Mode::Ok);
@@ -277,6 +288,7 @@ fn disconnect_and_reconnect_is_padded_with_silence() {
 
 #[test]
 fn stalled_device_is_detected_and_padded() {
+    let _serial = serial();
     let root = tempfile::tempdir().unwrap();
     let ok = Control::new(Mode::Ok);
     let staller = Control::new(Mode::Ok);
@@ -314,6 +326,7 @@ fn stalled_device_is_detected_and_padded() {
 
 #[test]
 fn missing_device_records_silence_without_blocking_others() {
+    let _serial = serial();
     let root = tempfile::tempdir().unwrap();
     let ok = Control::new(Mode::Ok);
     let gone = Control::new(Mode::Gone);
@@ -340,6 +353,7 @@ fn missing_device_records_silence_without_blocking_others() {
 
 #[test]
 fn late_device_is_aligned_to_session_start() {
+    let _serial = serial();
     let root = tempfile::tempdir().unwrap();
     let ok = Control::new(Mode::Ok);
     let late = Control::new(Mode::Gone);
@@ -368,6 +382,7 @@ fn late_device_is_aligned_to_session_start() {
 
 #[test]
 fn data_on_disk_while_recording_is_recoverable() {
+    let _serial = serial();
     let root = tempfile::tempdir().unwrap();
     let ok = Control::new(Mode::Ok);
     let rec = Recorder::start(
@@ -404,6 +419,7 @@ fn data_on_disk_while_recording_is_recoverable() {
 
 #[test]
 fn runaway_device_cannot_fill_the_disk() {
+    let _serial = serial();
     let root = tempfile::tempdir().unwrap();
     let ok = Control::new(Mode::Ok);
     let flood = Control::new(Mode::Flood);
@@ -438,6 +454,7 @@ fn runaway_device_cannot_fill_the_disk() {
 
 #[test]
 fn choppy_device_raises_warning_and_meters_move() {
+    let _serial = serial();
     let root = tempfile::tempdir().unwrap();
     let ok = Control::new(Mode::Ok);
     let choppy = Control::new(Mode::Choppy);
@@ -472,6 +489,7 @@ fn choppy_device_raises_warning_and_meters_move() {
 
 #[test]
 fn monitor_checks_devices_without_recording() {
+    let _serial = serial();
     let root = tempfile::tempdir().unwrap();
     let ok = Control::new(Mode::Ok);
     let choppy = Control::new(Mode::Choppy);
@@ -532,6 +550,7 @@ fn monitor_checks_devices_without_recording() {
 
 #[test]
 fn quiet_loopback_is_padded_not_reconnected() {
+    let _serial = serial();
     let root = tempfile::tempdir().unwrap();
     let ok = Control::new(Mode::Ok);
     // Windows loopback delivers no data at all while nothing is playing.
@@ -609,6 +628,7 @@ fn live_config(format: ExportFormat) -> RecorderConfig {
 
 #[test]
 fn live_export_runs_during_recording_and_matches_timeline() {
+    let _serial = serial();
     for format in [ExportFormat::Wav, ExportFormat::Flac] {
         let root = tempfile::tempdir().unwrap();
         let ok = Control::new(Mode::Ok);
@@ -683,6 +703,7 @@ fn live_export_runs_during_recording_and_matches_timeline() {
 
 #[test]
 fn failed_live_export_falls_back_to_raw_capture() {
+    let _serial = serial();
     // FLAC can't hold 10 channels, so the live export fails immediately.
     let root = tempfile::tempdir().unwrap();
     let ok = Control::new(Mode::Ok);
