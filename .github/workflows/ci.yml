@@ -43,7 +43,7 @@ jobs:
       - if: failure()
         shell: bash
         run: |
-          msg=$(grep -E -A4 "panicked at|^---- " test-output.txt | head -60 || true)
+          msg=$(grep -E -A30 "panicked at|^---- " test-output.txt | head -150 || true)
           msg=${msg//'%'/'%25'}
           msg=${msg//$'\r'/}
           msg=${msg//$'\n'/'%0A'}

@@ -600,10 +600,16 @@ fn quiet_loopback_is_padded_not_reconnected() {
     assert_eq!(mic.len(), spk.len());
     // Audio lands where playback started and resumed on the shared timeline.
     let frames: Vec<bool> = spk.as_chunks::<2>().0.iter().map(|f| f[0] != 0.0).collect();
+    // On failure, show where audio actually landed and what the track logged.
+    let diag = format!(
+        "\naudio segments (s): {:?}\nplaying {playing:.3}, paused {paused:.3}, resumed {resumed_at:.3}\n{}",
+        segments(&frames, 48_000),
+        std::fs::read_to_string(dir.join(session::LOG_FILE)).unwrap_or_default()
+    );
     let first = frames.iter().position(|&a| a).unwrap() as f64 / 48_000.0;
     assert!(
         first > playing - 0.05 && first < playing + 0.2,
-        "playback started at {playing:.2} s, audio starts at {first}"
+        "playback started at {playing:.2} s, audio starts at {first}{diag}"
     );
     // Search from the middle of the pause.
     let from = (paused + resumed_at) / 2.0;
@@ -615,8 +621,26 @@ fn quiet_loopback_is_padded_not_reconnected() {
         + from;
     assert!(
         resumed > resumed_at - 0.05 && resumed < resumed_at + 0.2,
-        "playback resumed at {resumed_at:.2} s, audio resumes at {resumed}"
+        "playback resumed at {resumed_at:.2} s, audio resumes at {resumed}{diag}"
     );
+}
+
+/// Start and end times of runs of audio (non-silent frames).
+fn segments(frames: &[bool], rate: u32) -> Vec<(f64, f64)> {
+    let secs = |i: usize| (i as f64 / f64::from(rate) * 1000.0).round() / 1000.0;
+    let mut out = Vec::new();
+    let mut start = None;
+    for (i, &a) in frames.iter().chain([&false]).enumerate() {
+        match (a, start) {
+            (true, None) => start = Some(i),
+            (false, Some(s)) => {
+                out.push((secs(s), secs(i)));
+                start = None;
+            }
+            _ => {}
+        }
+    }
+    out
 }
 
 fn live_config(format: ExportFormat) -> RecorderConfig {
