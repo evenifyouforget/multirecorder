@@ -436,6 +436,74 @@ fn choppy_device_raises_warning_and_meters_move() {
     let (dir, _) = rec.stop(Duration::from_secs(5)).unwrap();
     let log = std::fs::read_to_string(dir.join(session::LOG_FILE)).unwrap();
     assert!(log.contains("(choppy): WARNING choppy audio"), "{log}");
+    // Individual dropouts are on record too, not only the choppy warning.
+    let dropout_lines = |track: &str| {
+        log.lines()
+            .filter(|l| l.contains(track) && l.contains("dropout(s): short gap"))
+            .count()
+    };
+    assert!(dropout_lines("(choppy)") >= 1, "{log}");
+    assert_eq!(dropout_lines("(ok)"), 0, "{log}");
+}
+
+#[test]
+fn monitor_checks_devices_without_recording() {
+    let root = tempfile::tempdir().unwrap();
+    let ok = Control::new(Mode::Ok);
+    let choppy = Control::new(Mode::Choppy);
+    let unplugged = Control::new(Mode::Ok);
+    let rec = Recorder::monitor(
+        root.path(),
+        vec![
+            spec("ok", &ok, 48_000, 2, 0.5),
+            spec("choppy", &choppy, 48_000, 2, 0.5),
+            spec("unplugged", &unplugged, 44_100, 1, 0.5),
+        ],
+        test_config(),
+    )
+    .unwrap();
+    assert!(rec.is_monitor());
+    thread::sleep(Duration::from_millis(400));
+    unplugged.set(Mode::Gone);
+    thread::sleep(Duration::from_millis(1100));
+
+    let statuses = rec.statuses();
+    assert!(!statuses[0].1.warnings.any_problem());
+    assert!(statuses[0].1.levels.iter().all(|&l| l > 0.3));
+    assert!(
+        statuses[1].1.warnings.choppy,
+        "{:?}",
+        statuses[1].1.warnings
+    );
+    assert!(matches!(statuses[2].1.state, TrackState::Reconnecting(_)));
+    let events = rec.take_events().join("\n");
+    assert!(
+        events.contains("monitoring started (not recording)"),
+        "{events}"
+    );
+    assert!(
+        events.contains("(choppy): WARNING choppy audio"),
+        "{events}"
+    );
+    assert!(events.contains("(unplugged): lost device"), "{events}");
+    assert!(rec.take_events().iter().all(|e| !e.contains("started")));
+
+    let log_path = rec.stop_monitor(Duration::from_secs(5));
+    let log = std::fs::read_to_string(&log_path).unwrap();
+    assert!(log.contains("dropout(s)"), "{log}");
+    assert!(log.contains("monitoring stopped after"), "{log}");
+    // Nothing but the log was written: no session folder, no audio.
+    let entries: Vec<_> = std::fs::read_dir(root.path())
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .collect();
+    assert_eq!(entries, vec![log_path.clone()]);
+    let name = log_path.file_name().unwrap().to_string_lossy().into_owned();
+    assert!(
+        name.starts_with("monitor-") && name.ends_with(".log"),
+        "{name}"
+    );
+    assert!(session::find_unexported_sessions(root.path()).is_empty());
 }
 
 #[test]
