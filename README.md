@@ -38,6 +38,17 @@ choose **Open** the first time. The Linux build needs ALSA (`libasound2`).
 
 Each device records at its own native sample rate and channel count.
 
+### Monitor only
+
+**Monitor only…** runs the same checks as a recording (meters, warnings,
+gaps, reconnects) **without recording anything**, e.g. to watch for audio
+cutting out while streaming. It asks for confirmation first, and while it
+runs the top bar says **MONITORING — NOT RECORDING**. Every problem is listed
+under Messages with its time and written to `monitor-YYYYMMDD-HHMMSS.log` in
+the output folder (a few KB; no audio). It sees what the device delivers to the
+computer, so problems later in the chain (e.g. in OBS's encoder or upload)
+won't show up.
+
 ### Warnings
 
 | Warning | Meaning |

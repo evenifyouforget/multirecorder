@@ -6,6 +6,9 @@
 //! All tracks share one timeline that starts when recording starts. Whenever a
 //! track has no audio (device missing, stalled, ring buffer overflow) it is
 //! padded with silence, so tracks stay aligned and have equal length at the end.
+//!
+//! In monitor mode the same track threads run with the same checks, but no
+//! audio is written and no session folder is created; only an event log is.
 
 use std::fs::File;
 use std::io::{BufWriter, Write};
@@ -124,8 +127,11 @@ struct Track {
 }
 
 pub struct Recorder {
+    /// Session folder, or the output folder holding the log when monitoring.
     dir: PathBuf,
-    meta: SessionMeta,
+    /// None when monitoring.
+    meta: Option<SessionMeta>,
+    log_path: PathBuf,
     start: Instant,
     stop_at: Arc<OnceLock<Instant>>,
     tracks: Vec<Track>,
@@ -137,20 +143,10 @@ impl Recorder {
     pub fn start(root: &Path, specs: Vec<TrackSpec>, config: RecorderConfig) -> Result<Self> {
         anyhow::ensure!(!specs.is_empty(), "no devices selected");
         let dir = session::create_session_dir(root)?;
-        let log = Arc::new(SessionLog::open(&dir));
+        let log_path = dir.join(session::LOG_FILE);
+        let log = Arc::new(SessionLog::open_file(&log_path));
 
-        let metas: Vec<TrackMeta> = specs
-            .iter()
-            .enumerate()
-            .map(|(i, s)| TrackMeta {
-                raw_file: session::raw_file_name(i, &s.device_name),
-                device_name: s.device_name.clone(),
-                device_id: s.device_id.clone(),
-                sample_rate: s.sample_rate,
-                channels: s.channels,
-                loopback: s.loopback,
-            })
-            .collect();
+        let metas = track_metas(&specs, |i, s| session::raw_file_name(i, &s.device_name));
         let meta = SessionMeta::new(metas.clone());
         meta.save(&dir)?;
 
@@ -158,15 +154,67 @@ impl Recorder {
             .iter()
             .map(|m| {
                 let path = dir.join(&m.raw_file);
-                File::create(&path).with_context(|| format!("creating {}", path.display()))
+                File::create(&path)
+                    .map(Some)
+                    .with_context(|| format!("creating {}", path.display()))
             })
             .collect::<Result<Vec<_>>>()?;
         session::sync_dir(&dir);
 
         log.line(&format!("recording started in {}", dir.display()));
-        let start = Instant::now();
-        let stop_at = Arc::new(OnceLock::new());
-        let mut tracks = Vec::new();
+        let mut rec = Self {
+            dir,
+            meta: Some(meta),
+            log_path,
+            start: Instant::now(),
+            stop_at: Arc::new(OnceLock::new()),
+            tracks: Vec::new(),
+            log,
+        };
+        rec.spawn_tracks(specs, metas, files, &config)?;
+        Ok(rec)
+    }
+
+    /// Watches every track like a recording would (meters, warnings, gaps,
+    /// reconnects) without writing any audio. Events go to
+    /// `<root>/monitor-YYYYMMDD-HHMMSS.log`; if that can't be written,
+    /// monitoring still runs.
+    pub fn monitor(root: &Path, specs: Vec<TrackSpec>, config: RecorderConfig) -> Result<Self> {
+        anyhow::ensure!(!specs.is_empty(), "no devices selected");
+        if let Err(e) = std::fs::create_dir_all(root) {
+            log::warn!("cannot create {}: {e}", root.display());
+        }
+        let stamp = chrono::Local::now().format("%Y%m%d-%H%M%S");
+        let log_path = root.join(format!("monitor-{stamp}.log"));
+        let log = Arc::new(SessionLog::open_file(&log_path));
+        let metas = track_metas(&specs, |_, _| String::new());
+        let files = metas.iter().map(|_| None).collect();
+        log.line("monitoring started (not recording)");
+        let mut rec = Self {
+            dir: root.to_path_buf(),
+            meta: None,
+            log_path,
+            start: Instant::now(),
+            stop_at: Arc::new(OnceLock::new()),
+            tracks: Vec::new(),
+            log,
+        };
+        let config = RecorderConfig {
+            live_export: None,
+            ..config
+        };
+        rec.spawn_tracks(specs, metas, files, &config)?;
+        Ok(rec)
+    }
+
+    fn spawn_tracks(
+        &mut self,
+        specs: Vec<TrackSpec>,
+        metas: Vec<TrackMeta>,
+        files: Vec<Option<File>>,
+        config: &RecorderConfig,
+    ) -> Result<()> {
+        let log = &self.log;
         for (i, ((spec, meta), file)) in specs.into_iter().zip(metas).zip(files).enumerate() {
             log.line(&format!(
                 "track {}: {} ({} ch, {} Hz)",
@@ -190,7 +238,7 @@ impl Recorder {
             // Export runs beside the recording; if it can't start, the track is
             // simply exported after Stop instead.
             let export = config.live_export.and_then(|format| {
-                LiveExport::spawn(&dir, &meta, format)
+                LiveExport::spawn(&self.dir, &meta, format)
                     .inspect_err(|e| log.line(&format!("live export unavailable: {e:#}")))
                     .ok()
             });
@@ -201,8 +249,8 @@ impl Recorder {
                 sample_rate: meta.sample_rate,
                 channels: meta.channels,
                 loopback: meta.loopback,
-                start,
-                stop_at: stop_at.clone(),
+                start: self.start,
+                stop_at: self.stop_at.clone(),
                 status: status.clone(),
                 log: log.clone(),
                 config: config.clone(),
@@ -212,21 +260,28 @@ impl Recorder {
                 .name(format!("track-{}", i + 1))
                 .spawn(move || worker.run_guarded())
                 .context("spawning track thread")?;
-            tracks.push(Track {
+            self.tracks.push(Track {
                 meta,
                 status,
                 thread: Some(thread),
                 export,
             });
         }
-        Ok(Self {
-            dir,
-            meta,
-            start,
-            stop_at,
-            tracks,
-            log,
-        })
+        Ok(())
+    }
+
+    pub fn is_monitor(&self) -> bool {
+        self.meta.is_none()
+    }
+
+    /// The session's `session.log`, or the monitor log.
+    pub fn log_path(&self) -> &Path {
+        &self.log_path
+    }
+
+    /// Log lines written since the previous call, for display.
+    pub fn take_events(&self) -> Vec<String> {
+        self.log.take_new()
     }
 
     pub fn dir(&self) -> &Path {
@@ -267,6 +322,31 @@ impl Recorder {
         timeout: Duration,
         progress: &mut dyn FnMut(f32),
     ) -> Result<(PathBuf, SessionMeta)> {
+        self.stop_tracks(timeout);
+        self.finish_exports(progress);
+        let mut meta = self.meta.take().context("monitoring, not recording")?;
+        meta.state = SessionState::Stopped;
+        meta.save(&self.dir)?;
+        self.log.line(&format!(
+            "recording stopped after {:.1} s",
+            self.elapsed().as_secs_f64()
+        ));
+        Ok((self.dir.clone(), meta))
+    }
+
+    /// Stops monitoring; returns the monitor log's path.
+    pub fn stop_monitor(mut self, timeout: Duration) -> PathBuf {
+        self.stop_tracks(timeout);
+        self.log.line(&format!(
+            "monitoring stopped after {:.1} s",
+            self.elapsed().as_secs_f64()
+        ));
+        self.log_path.clone()
+    }
+
+    /// Signals every track to stop and waits for them; a track thread stuck
+    /// inside a driver call is abandoned after `timeout`.
+    fn stop_tracks(&mut self, timeout: Duration) {
         let _ = self.stop_at.set(Instant::now());
         let deadline = Instant::now() + timeout;
         for track in &mut self.tracks {
@@ -288,15 +368,25 @@ impl Recorder {
                 }
             }
         }
-        self.finish_exports(progress);
-        self.meta.state = SessionState::Stopped;
-        self.meta.save(&self.dir)?;
-        self.log.line(&format!(
-            "recording stopped after {:.1} s",
-            self.elapsed().as_secs_f64()
-        ));
-        Ok((self.dir.clone(), self.meta.clone()))
     }
+}
+
+fn track_metas(
+    specs: &[TrackSpec],
+    raw_file: impl Fn(usize, &TrackSpec) -> String,
+) -> Vec<TrackMeta> {
+    specs
+        .iter()
+        .enumerate()
+        .map(|(i, s)| TrackMeta {
+            raw_file: raw_file(i, s),
+            device_name: s.device_name.clone(),
+            device_id: s.device_id.clone(),
+            sample_rate: s.sample_rate,
+            channels: s.channels,
+            loopback: s.loopback,
+        })
+        .collect()
 }
 
 impl Recorder {
@@ -332,17 +422,19 @@ impl Recorder {
 }
 
 /// Buffered writer for a raw capture file that tracks its length in frames.
+/// Without a file (monitor mode) it only counts, so the timeline logic is
+/// identical with and without recording.
 struct RawWriter {
-    file: BufWriter<File>,
+    file: Option<BufWriter<File>>,
     channels: usize,
     samples: u64,
     scratch: Vec<u8>,
 }
 
 impl RawWriter {
-    fn new(file: File, channels: u16) -> Self {
+    fn new(file: Option<File>, channels: u16) -> Self {
         Self {
-            file: BufWriter::with_capacity(256 * 1024, file),
+            file: file.map(|f| BufWriter::with_capacity(256 * 1024, f)),
             channels: usize::from(channels),
             samples: 0,
             scratch: Vec::new(),
@@ -355,21 +447,25 @@ impl RawWriter {
     }
 
     fn write_samples(&mut self, samples: &[f32]) -> std::io::Result<()> {
-        self.scratch.clear();
-        self.scratch
-            .extend(samples.iter().flat_map(|s| s.to_le_bytes()));
-        self.file.write_all(&self.scratch)?;
+        if let Some(file) = &mut self.file {
+            self.scratch.clear();
+            self.scratch
+                .extend(samples.iter().flat_map(|s| s.to_le_bytes()));
+            file.write_all(&self.scratch)?;
+        }
         self.samples += samples.len() as u64;
         Ok(())
     }
 
     fn write_silence(&mut self, frames: u64) -> std::io::Result<()> {
         static CHUNK: [u8; 64 * 1024] = [0; 64 * 1024];
-        let mut bytes = frames * self.channels as u64 * 4;
-        while bytes > 0 {
-            let n = bytes.min(CHUNK.len() as u64) as usize;
-            self.file.write_all(&CHUNK[..n])?;
-            bytes -= n as u64;
+        if let Some(file) = &mut self.file {
+            let mut bytes = frames * self.channels as u64 * 4;
+            while bytes > 0 {
+                let n = bytes.min(CHUNK.len() as u64) as usize;
+                file.write_all(&CHUNK[..n])?;
+                bytes -= n as u64;
+            }
         }
         self.samples += frames * self.channels as u64;
         Ok(())
@@ -386,18 +482,23 @@ impl RawWriter {
 
     fn truncate_to(&mut self, frames: u64) -> std::io::Result<()> {
         if self.frames() > frames {
-            self.file.flush()?;
-            self.file
-                .get_ref()
-                .set_len(frames * self.channels as u64 * 4)?;
+            if let Some(file) = &mut self.file {
+                file.flush()?;
+                file.get_ref().set_len(frames * self.channels as u64 * 4)?;
+            }
             self.samples = frames * self.channels as u64;
         }
         Ok(())
     }
 
     fn sync(&mut self) -> std::io::Result<()> {
-        self.file.flush()?;
-        self.file.get_ref().sync_data()
+        match &mut self.file {
+            Some(file) => {
+                file.flush()?;
+                file.get_ref().sync_data()
+            }
+            None => Ok(()),
+        }
     }
 }
 
@@ -459,9 +560,6 @@ impl TrackWorker {
                 self.name, new.dropouts
             ));
         }
-        if new.clipping && !old.clipping {
-            self.log.line(&format!("{}: WARNING clipping", self.name));
-        }
         if new.no_signal != old.no_signal {
             let what = if new.no_signal {
                 "no signal"
@@ -470,6 +568,26 @@ impl TrackWorker {
             };
             self.log.line(&format!("{}: {what}", self.name));
         }
+    }
+
+    /// Logs dropouts and clipping since the last report, at most once a
+    /// second, so a single short cutout is on record without flooding the log.
+    fn log_new_events(&self, reported: &mut Warnings, now: &Warnings) {
+        let dropouts = now.dropouts - reported.dropouts;
+        if dropouts > 0 {
+            self.log.line(&format!(
+                "{}: {dropouts} dropout(s): short gap of digital silence ({} so far)",
+                self.name, now.dropouts
+            ));
+        }
+        let clips = now.clip_events - reported.clip_events;
+        if clips > 0 {
+            self.log.line(&format!(
+                "{}: clipping, {clips} time(s) ({} so far)",
+                self.name, now.clip_events
+            ));
+        }
+        reported.clone_from(now);
     }
 
     fn set_state(&self, state: TrackState) {
@@ -498,6 +616,8 @@ impl TrackWorker {
         let mut silence = 0u64;
         let mut analyzer = Analyzer::new(self.channels, self.sample_rate);
         let mut warnings = Warnings::default();
+        let mut reported = Warnings::default();
+        let mut last_events = Instant::now();
         let mut levels = vec![0.0f32; usize::from(self.channels)];
         let mut last_meter = Instant::now();
         let mut history = LevelHistory::new(last_meter);
@@ -649,6 +769,7 @@ impl TrackWorker {
                     drop(s._stream);
                     drain(&mut s.consumer, &mut self.writer, &mut analyzer, limit)?;
                 }
+                self.log_new_events(&mut reported, &analyzer.warnings());
                 let end = self.timeline_frames(t);
                 silence += self.writer.pad_to(end)?;
                 self.writer.truncate_to(end)?;
@@ -683,6 +804,10 @@ impl TrackWorker {
             let history_changed = history.add(now, peaks.iter().copied().fold(0.0, f32::max));
             let current = analyzer.warnings();
             self.log_warning_changes(&warnings, &current);
+            if now.duration_since(last_events) >= Duration::from_secs(1) {
+                self.log_new_events(&mut reported, &current);
+                last_events = now;
+            }
             warnings = current;
             {
                 let mut st = self.status.lock().expect("status lock");

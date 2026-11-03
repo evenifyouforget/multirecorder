@@ -57,6 +57,7 @@ struct Job {
 
 enum Phase {
     Idle,
+    /// Recording, or monitoring without recording (see [`Recorder::is_monitor`]).
     Recording(Recorder),
     Finishing(Arc<Mutex<Job>>),
 }
@@ -68,6 +69,8 @@ pub struct MultiRecorderApp {
     unexported: Vec<(PathBuf, SessionMeta)>,
     messages: Vec<String>,
     confirm_quit: bool,
+    /// The "monitor without recording?" dialog is open.
+    confirm_monitor: bool,
     /// Most recent session folder, for the "Open last session" button.
     last_session: Option<PathBuf>,
     /// Free disk space and process RAM, refreshed every couple of seconds.
@@ -89,6 +92,7 @@ impl MultiRecorderApp {
             unexported: Vec::new(),
             messages: Vec::new(),
             confirm_quit: false,
+            confirm_monitor: false,
             last_session: None,
             resources: None,
             warned_low_disk: false,
@@ -122,9 +126,8 @@ impl MultiRecorderApp {
         self.unexported = session::find_unexported_sessions(Path::new(&self.settings.output_dir));
     }
 
-    fn start_recording(&mut self) {
-        let specs: Vec<TrackSpec> = self
-            .devices
+    fn selected_specs(&self) -> Vec<TrackSpec> {
+        self.devices
             .iter()
             .filter(|d| self.settings.selected.contains(&d.key()))
             .map(|d| TrackSpec {
@@ -144,21 +147,37 @@ impl MultiRecorderApp {
                     loopback: d.loopback,
                 }),
             })
-            .collect();
+            .collect()
+    }
+
+    fn start_recording(&mut self) {
         match Recorder::start(
             Path::new(&self.settings.output_dir),
-            specs,
+            self.selected_specs(),
             RecorderConfig {
                 live_export: Some(self.settings.format),
                 ..RecorderConfig::default()
             },
         ) {
             Ok(rec) => {
-                self.message(format!("Recording to {}", rec.dir().display()));
                 self.last_session = Some(rec.dir().to_path_buf());
                 self.phase = Phase::Recording(rec);
             }
             Err(e) => self.message(format!("Could not start recording: {e:#}")),
+        }
+    }
+
+    fn start_monitoring(&mut self) {
+        match Recorder::monitor(
+            Path::new(&self.settings.output_dir),
+            self.selected_specs(),
+            RecorderConfig::default(),
+        ) {
+            Ok(rec) => {
+                self.message(format!("Monitor log: {}", rec.log_path().display()));
+                self.phase = Phase::Recording(rec);
+            }
+            Err(e) => self.message(format!("Could not start monitoring: {e:#}")),
         }
     }
 
@@ -170,6 +189,14 @@ impl MultiRecorderApp {
             text: "Stopping…".into(),
             ..Default::default()
         }));
+        if rec.is_monitor() {
+            spawn_job(job.clone(), ctx.clone(), move |_| {
+                let log = rec.stop_monitor(Duration::from_secs(5));
+                Ok(format!("Monitoring stopped. Log: {}", log.display()))
+            });
+            self.phase = Phase::Finishing(job);
+            return;
+        }
         let format = self.settings.format;
         spawn_job(job.clone(), ctx.clone(), move |job| {
             let mut progress = |p: f32| {
@@ -303,6 +330,13 @@ impl MultiRecorderApp {
                     if ui.add_enabled(count > 0, button).clicked() {
                         self.start_recording();
                     }
+                    if ui
+                        .add_enabled(count > 0, egui::Button::new("Monitor only…"))
+                        .on_hover_text("Watch the devices for problems without recording")
+                        .clicked()
+                    {
+                        self.confirm_monitor = true;
+                    }
                     ui.label(format!("{count} device(s) selected"));
                     if let Some(dir) = self.last_session.clone() {
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -316,6 +350,7 @@ impl MultiRecorderApp {
             Phase::Recording(rec) => {
                 let elapsed = rec.elapsed().as_secs();
                 let dir = rec.dir().to_path_buf();
+                let monitor = rec.is_monitor();
                 let attention = rec
                     .statuses()
                     .iter()
@@ -323,9 +358,15 @@ impl MultiRecorderApp {
                     .count();
                 let (mut stop, mut open) = (false, false);
                 ui.horizontal(|ui| {
-                    stop = ui
-                        .button(egui::RichText::new("■  Stop").size(18.0))
-                        .clicked();
+                    let label = if monitor {
+                        "■  Stop monitoring"
+                    } else {
+                        "■  Stop"
+                    };
+                    stop = ui.button(egui::RichText::new(label).size(18.0)).clicked();
+                    if monitor {
+                        monitor_banner(ui);
+                    }
                     ui.label(
                         egui::RichText::new(format!(
                             "{:02}:{:02}:{:02}",
@@ -344,7 +385,12 @@ impl MultiRecorderApp {
                         );
                     }
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        open = ui.button("Open session folder").clicked();
+                        let label = if monitor {
+                            "Open log folder"
+                        } else {
+                            "Open session folder"
+                        };
+                        open = ui.button(label).clicked();
                     });
                 });
                 if open {
@@ -394,10 +440,14 @@ impl MultiRecorderApp {
         let (rate, devices, busiest) = match &self.phase {
             Phase::Recording(rec) => {
                 let statuses = rec.statuses();
-                let rate: f64 = statuses
-                    .iter()
-                    .map(|(m, _)| resources::track_disk_rate(m.sample_rate, m.channels, format))
-                    .sum();
+                let rate: f64 = if rec.is_monitor() {
+                    0.0
+                } else {
+                    statuses
+                        .iter()
+                        .map(|(m, _)| resources::track_disk_rate(m.sample_rate, m.channels, format))
+                        .sum()
+                };
                 let busiest = statuses
                     .iter()
                     .map(|(_, st)| st.load.max())
@@ -471,6 +521,12 @@ impl MultiRecorderApp {
             return;
         };
         let statuses = rec.statuses();
+        let monitor = rec.is_monitor();
+        let (active, duration) = if monitor {
+            ("monitoring", "Monitored")
+        } else {
+            ("recording", "Recorded")
+        };
         egui::Grid::new("tracks")
             .striped(true)
             .num_columns(9)
@@ -481,7 +537,7 @@ impl MultiRecorderApp {
                     "Last minute",
                     "Status",
                     "Warnings",
-                    "Recorded",
+                    duration,
                     "Gaps",
                     "Reconnects",
                     "Load",
@@ -500,9 +556,9 @@ impl MultiRecorderApp {
                     let (text, color) = match &st.state {
                         TrackState::Starting => ("starting".to_string(), egui::Color32::GRAY),
                         TrackState::Recording if st.idle => {
-                            ("recording (idle)".to_string(), egui::Color32::GRAY)
+                            (format!("{active} (idle)"), egui::Color32::GRAY)
                         }
-                        TrackState::Recording => ("recording".to_string(), GREEN),
+                        TrackState::Recording => (active.to_string(), GREEN),
                         TrackState::Reconnecting(e) => (format!("reconnecting: {e}"), ORANGE),
                         TrackState::Stopped => ("stopped".to_string(), egui::Color32::GRAY),
                         TrackState::Failed(e) => (format!("failed: {e}"), RED),
@@ -567,6 +623,63 @@ impl MultiRecorderApp {
             self.export_existing(dir, ui.ctx());
         }
     }
+
+    /// Confirmation before monitoring, so nobody runs a whole session thinking
+    /// it is being recorded. Cancel has focus, so Enter or Escape cancels.
+    fn monitor_dialog(&mut self, ctx: &egui::Context) {
+        let mut start = false;
+        let response = egui::Modal::new(egui::Id::unique("confirm_monitor")).show(ctx, |ui| {
+            ui.set_max_width(420.0);
+            ui.heading("Monitor without recording?");
+            ui.add_space(6.0);
+            ui.label(
+                egui::RichText::new("Monitor mode does NOT record. No audio is saved.").strong(),
+            );
+            ui.add_space(4.0);
+            ui.label(
+                "It watches the selected devices for problems: dropouts, gaps, \
+                 disconnects, clipping and missing signal, with level meters. Problems \
+                 are listed under Messages and written to a small log file in the \
+                 output folder.",
+            );
+            ui.add_space(4.0);
+            ui.label("To keep the audio, use Record instead: it shows the same checks.");
+            ui.add_space(10.0);
+            ui.horizontal(|ui| {
+                let cancel = ui.button("Cancel");
+                if ui.memory(|m| m.focused().is_none()) {
+                    cancel.request_focus();
+                }
+                if cancel.clicked() {
+                    self.confirm_monitor = false;
+                }
+                start = ui.button("Start monitoring (no recording)").clicked();
+            });
+        });
+        if response.should_close() {
+            self.confirm_monitor = false;
+        }
+        if start {
+            self.confirm_monitor = false;
+            self.start_monitoring();
+        }
+    }
+}
+
+/// Shown for the whole monitoring session so it can't be mistaken for a recording.
+fn monitor_banner(ui: &mut egui::Ui) {
+    egui::Frame::new()
+        .fill(ORANGE)
+        .corner_radius(4.0)
+        .inner_margin(egui::Margin::symmetric(8, 3))
+        .show(ui, |ui| {
+            ui.label(
+                egui::RichText::new("MONITORING — NOT RECORDING")
+                    .color(egui::Color32::BLACK)
+                    .strong()
+                    .size(15.0),
+            );
+        });
 }
 
 fn needs_attention(st: &TrackStatus) -> bool {
@@ -760,6 +873,11 @@ impl eframe::App for MultiRecorderApp {
             // Keep meters and status fresh; recording itself does not depend on the UI running.
             ctx.request_repaint_after(Duration::from_millis(66));
         }
+        if let Phase::Recording(rec) = &self.phase {
+            for line in rec.take_events() {
+                self.message(line);
+            }
+        }
         if ctx.input(|i| i.viewport().close_requested()) && !matches!(self.phase, Phase::Idle) {
             ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
             self.confirm_quit = true;
@@ -800,12 +918,17 @@ impl eframe::App for MultiRecorderApp {
                 });
         });
 
+        if self.confirm_monitor {
+            self.monitor_dialog(ui.ctx());
+        }
         if self.confirm_quit {
-            egui::Window::new("Recording in progress")
+            egui::Window::new("Still running")
                 .collapsible(false)
                 .resizable(false)
                 .show(ui.ctx(), |ui| {
-                    ui.label("Stop the recording (and let the export finish) before closing.");
+                    ui.label(
+                        "Stop the recording or monitoring (and let the export finish) before closing.",
+                    );
                     if ui.button("OK").clicked() {
                         self.confirm_quit = false;
                     }

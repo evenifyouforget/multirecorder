@@ -181,21 +181,28 @@ pub fn find_unexported_sessions(root: &Path) -> Vec<(PathBuf, SessionMeta)> {
 }
 
 /// Append-only event log stored next to the recording, flushed on every line.
+/// Lines are also kept until [`SessionLog::take_new`] so the app can show them.
 pub struct SessionLog {
     file: Mutex<Option<File>>,
+    new_lines: Mutex<Vec<String>>,
 }
+
+/// Unread lines kept for the app; older ones are dropped if nobody reads them.
+const MAX_NEW_LINES: usize = 500;
 
 impl SessionLog {
     pub fn open(dir: &Path) -> Self {
-        let file = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(dir.join(LOG_FILE));
+        Self::open_file(&dir.join(LOG_FILE))
+    }
+
+    pub fn open_file(path: &Path) -> Self {
+        let file = OpenOptions::new().create(true).append(true).open(path);
         if let Err(e) = &file {
-            log::warn!("cannot open session log: {e}");
+            log::warn!("cannot open log {}: {e}", path.display());
         }
         Self {
             file: Mutex::new(file.ok()),
+            new_lines: Mutex::new(Vec::new()),
         }
     }
 
@@ -209,6 +216,20 @@ impl SessionLog {
             let _ = writeln!(f, "{stamp} {msg}");
             let _ = f.flush();
         }
+        if let Ok(mut lines) = self.new_lines.lock() {
+            if lines.len() >= MAX_NEW_LINES {
+                lines.remove(0);
+            }
+            lines.push(msg.to_string());
+        }
+    }
+
+    /// Lines logged since the previous call.
+    pub fn take_new(&self) -> Vec<String> {
+        self.new_lines
+            .lock()
+            .map(|mut l| std::mem::take(&mut *l))
+            .unwrap_or_default()
     }
 }
 
