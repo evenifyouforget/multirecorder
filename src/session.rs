@@ -93,6 +93,24 @@ impl SessionMeta {
     }
 }
 
+/// Session start for people lining up recordings by clock: local time with
+/// milliseconds and UTC offset, plus the same moment in UTC, e.g.
+/// `2026-11-11 14:03:22.517 +01:00 (13:03:22.517 UTC)`.
+pub fn format_start(t: &chrono::DateTime<chrono::Local>) -> String {
+    format!(
+        "{} ({} UTC)",
+        t.format("%Y-%m-%d %H:%M:%S%.3f %:z"),
+        t.with_timezone(&chrono::Utc).format("%H:%M:%S%.3f")
+    )
+}
+
+/// Parses `started_at` from session.json for display.
+pub fn parse_start(started_at: &str) -> Option<chrono::DateTime<chrono::Local>> {
+    chrono::DateTime::parse_from_rfc3339(started_at)
+        .ok()
+        .map(|t| t.with_timezone(&chrono::Local))
+}
+
 /// Makes a device name safe to use as part of a file name on every OS.
 pub fn sanitize_file_name(name: &str) -> String {
     let cleaned: String = name
@@ -236,6 +254,15 @@ impl SessionLog {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn start_time_keeps_milliseconds_and_offset() {
+        let t = parse_start("2026-11-11T14:03:22.517+01:00").unwrap();
+        let text = format_start(&t);
+        assert!(text.contains(":22.517"), "{text}");
+        assert!(text.ends_with("(13:03:22.517 UTC)"), "{text}");
+        assert!(parse_start("x").is_none());
+    }
 
     #[test]
     fn sanitizes_names() {

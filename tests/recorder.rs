@@ -213,8 +213,18 @@ fn mixed_formats_stay_aligned() {
     .unwrap();
     thread::sleep(Duration::from_millis(800));
     let stopped = at(&rec);
+    let started = rec.started_at();
     let (dir, meta) = rec.stop(Duration::from_secs(5)).unwrap();
     assert_eq!(meta.state, SessionState::Stopped);
+    // The start time, to the millisecond, for lining up sessions by clock.
+    let saved = session::parse_start(&meta.started_at).unwrap();
+    assert!(
+        (started - saved).num_milliseconds().abs() < 1,
+        "{started} vs {saved}"
+    );
+    let log = std::fs::read_to_string(dir.join(session::LOG_FILE)).unwrap();
+    let line = format!("start time: {}", session::format_start(&saved));
+    assert!(log.contains(&line), "{line} not in {log}");
 
     let durations: Vec<f64> = meta
         .tracks

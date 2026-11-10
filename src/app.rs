@@ -349,6 +349,7 @@ impl MultiRecorderApp {
             }
             Phase::Recording(rec) => {
                 let elapsed = rec.elapsed().as_secs();
+                let started = rec.started_at();
                 let dir = rec.dir().to_path_buf();
                 let monitor = rec.is_monitor();
                 let attention = rec
@@ -357,6 +358,7 @@ impl MultiRecorderApp {
                     .filter(|(_, st)| needs_attention(st))
                     .count();
                 let (mut stop, mut open) = (false, false);
+                let mut copied = None;
                 ui.horizontal(|ui| {
                     let label = if monitor {
                         "■  Stop monitoring"
@@ -377,6 +379,27 @@ impl MultiRecorderApp {
                         .size(18.0)
                         .monospace(),
                     );
+                    if !monitor {
+                        let start = ui
+                            .add(
+                                egui::Label::new(format!(
+                                    "started {}",
+                                    started.format("%H:%M:%S%.3f")
+                                ))
+                                .sense(egui::Sense::click()),
+                            )
+                            .on_hover_text(
+                                "When the recording started (0:00 in every track), by this \
+                                 computer's clock. Compare it with the start time of a \
+                                 recording made on another computer to line them up. \
+                                 Click to copy.",
+                            );
+                        if start.clicked() {
+                            let text = session::format_start(&started);
+                            ui.ctx().copy_text(text.clone());
+                            copied = Some(text);
+                        }
+                    }
                     if attention > 0 {
                         ui.colored_label(
                             RED,
@@ -395,6 +418,9 @@ impl MultiRecorderApp {
                 });
                 if open {
                     self.open_folder(dir);
+                }
+                if let Some(text) = copied {
+                    self.message(format!("Copied start time: {text}"));
                 }
                 if stop {
                     self.stop_recording(&ctx);

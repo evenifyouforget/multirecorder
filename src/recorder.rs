@@ -138,6 +138,8 @@ pub struct Recorder {
     meta: Option<SessionMeta>,
     log_path: PathBuf,
     start: Instant,
+    /// Wall-clock time of `start`.
+    started: chrono::DateTime<chrono::Local>,
     stop_at: Arc<OnceLock<Instant>>,
     tracks: Vec<Track>,
     log: Arc<SessionLog>,
@@ -152,8 +154,7 @@ impl Recorder {
         let log = Arc::new(SessionLog::open_file(&log_path));
 
         let metas = track_metas(&specs, |i, s| session::raw_file_name(i, &s.device_name));
-        let meta = SessionMeta::new(metas.clone());
-        meta.save(&dir)?;
+        let mut meta = SessionMeta::new(metas.clone());
 
         let files = metas
             .iter()
@@ -166,12 +167,23 @@ impl Recorder {
             .collect::<Result<Vec<_>>>()?;
         session::sync_dir(&dir);
 
+        // Position 0 of every track is this moment. Wall clock and timeline
+        // are read together so the logged start time matches the audio.
+        let start = Instant::now();
+        let started = chrono::Local::now();
+        meta.started_at = started.to_rfc3339_opts(chrono::SecondsFormat::Millis, false);
+        meta.save(&dir)?;
         log.line(&format!("recording started in {}", dir.display()));
+        log.line(&format!(
+            "start time: {} = 0:00 in every track (this computer's clock)",
+            session::format_start(&started)
+        ));
         let mut rec = Self {
             dir,
             meta: Some(meta),
             log_path,
-            start: Instant::now(),
+            start,
+            started,
             stop_at: Arc::new(OnceLock::new()),
             tracks: Vec::new(),
             log,
@@ -200,6 +212,7 @@ impl Recorder {
             meta: None,
             log_path,
             start: Instant::now(),
+            started: chrono::Local::now(),
             stop_at: Arc::new(OnceLock::new()),
             tracks: Vec::new(),
             log,
@@ -287,6 +300,12 @@ impl Recorder {
     /// Log lines written since the previous call, for display.
     pub fn take_events(&self) -> Vec<String> {
         self.log.take_new()
+    }
+
+    /// When the shared timeline started (0:00 in every track), by this
+    /// computer's clock.
+    pub fn started_at(&self) -> chrono::DateTime<chrono::Local> {
+        self.started
     }
 
     pub fn dir(&self) -> &Path {

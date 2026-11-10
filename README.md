@@ -49,6 +49,25 @@ the output folder (a few KB; no audio). It sees what the device delivers to the
 computer, so problems later in the chain (e.g. in OBS's encoder or upload)
 won't show up.
 
+### Lining up recordings from several computers
+
+Every recording notes when it started, to the millisecond. 0:00 in every track
+is that moment. While recording, the time is shown next to the timer (click it
+to copy). Afterwards it is in the session's log (**Logs** button) and in
+`session.json`, e.g.
+
+```text
+start time: 2026-11-11 14:03:22.517 +01:00 (13:03:22.517 UTC) = 0:00 in every track
+```
+
+When friends each record their own side of a call, the difference between two
+start times is the offset between their recordings: if yours started at
+`13:03:22.517 UTC` and theirs at `13:03:25.017 UTC`, their 0:00 is at 2.5 s in
+yours. This is only as accurate as the two computers' clocks. On Windows, press
+**Sync now** under Settings → Time & language → Date & time before recording.
+Even synced clocks can differ by tens to hundreds of milliseconds, so for an
+exact match, clap once while everyone is recording and line up the claps.
+
 ### Warnings
 
 | Warning | Meaning |
