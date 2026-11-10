@@ -92,12 +92,12 @@ impl AppTarget {
         }
     }
 
-    /// Track name, e.g. "App: firefox" or "All except discord".
+    /// Track (and file) name, e.g. "firefox (app)" or "All except discord".
     pub fn track_name(&self) -> String {
         if self.exclude {
             format!("All except {}", self.app_name())
         } else {
-            format!("App: {}", self.app_name())
+            format!("{} (app)", self.app_name())
         }
     }
 }
@@ -556,6 +556,7 @@ fn fake_main(control: &PathBuf, out: &mut FrameWriter<impl Write>) -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::session;
 
     #[test]
     fn target_keys_round_trip() {
@@ -570,6 +571,12 @@ mod tests {
         assert_eq!(AppTarget::from_key("app:"), None);
         let t = AppTarget::from_key("app-except:Discord.EXE").unwrap();
         assert_eq!(t.track_name(), "All except Discord");
+        let t = AppTarget::from_key("app:firefox.exe").unwrap();
+        assert_eq!(t.track_name(), "firefox (app)");
+        assert_eq!(
+            session::sanitize_file_name(&t.track_name()),
+            "firefox (app)"
+        );
     }
 
     #[test]

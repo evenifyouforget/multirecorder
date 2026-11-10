@@ -2,7 +2,7 @@
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, mpsc};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -10,6 +10,7 @@ use eframe::egui;
 use serde::{Deserialize, Serialize};
 
 use crate::analysis::{LevelHistory, Warnings};
+use crate::apps::{self, AppInfo, AppSource, AppTarget};
 use crate::audio::{self, CpalSource, InputDeviceInfo};
 use crate::export::{self, ExportFormat};
 use crate::logs::{self, LogEntry};
@@ -48,6 +49,32 @@ impl Default for Settings {
     }
 }
 
+/// A slow lookup (devices, apps) running on its own thread. If a driver
+/// never answers, the window keeps working and just keeps waiting.
+struct Lookup<T> {
+    rx: mpsc::Receiver<T>,
+    started: Instant,
+}
+
+impl<T: Send + 'static> Lookup<T> {
+    fn spawn(ctx: &egui::Context, work: impl FnOnce() -> T + Send + 'static) -> Self {
+        let (tx, rx) = mpsc::channel();
+        let ctx = ctx.clone();
+        thread::spawn(move || {
+            let _ = tx.send(work());
+            ctx.request_repaint();
+        });
+        Self {
+            rx,
+            started: Instant::now(),
+        }
+    }
+
+    fn poll(&self) -> Option<T> {
+        self.rx.try_recv().ok()
+    }
+}
+
 /// Progress of the background stop-and-export job.
 #[derive(Default)]
 struct Job {
@@ -66,6 +93,13 @@ enum Phase {
 pub struct MultiRecorderApp {
     settings: Settings,
     devices: Vec<InputDeviceInfo>,
+    /// Device list being fetched in the background.
+    devices_lookup: Option<Lookup<Vec<InputDeviceInfo>>>,
+    /// Apps with audio sessions (Windows), fetched only once the Apps
+    /// section is opened.
+    apps: Option<Result<Vec<AppInfo>, String>>,
+    apps_lookup: Option<Lookup<Result<Vec<AppInfo>, String>>>,
+    ctx: egui::Context,
     phase: Phase,
     unexported: Vec<(PathBuf, SessionMeta)>,
     messages: Vec<String>,
@@ -141,6 +175,10 @@ impl MultiRecorderApp {
         let mut app = Self {
             settings,
             devices: Vec::new(),
+            devices_lookup: None,
+            apps: None,
+            apps_lookup: None,
+            ctx: cc.egui_ctx.clone(),
             phase: Phase::Idle,
             unexported: Vec::new(),
             messages: Vec::new(),
@@ -172,8 +210,37 @@ impl MultiRecorderApp {
         }
     }
 
+    /// Lists devices off the UI thread, so a stuck driver can't freeze the window.
     fn refresh_devices(&mut self) {
-        self.devices = audio::list_devices();
+        if self.devices_lookup.is_none() {
+            self.devices_lookup = Some(Lookup::spawn(&self.ctx, audio::list_devices));
+        }
+    }
+
+    fn refresh_apps(&mut self) {
+        if self.apps_lookup.is_none() {
+            self.apps_lookup = Some(Lookup::spawn(&self.ctx, apps::list_apps));
+        }
+    }
+
+    /// Selected apps (Windows only; ignored elsewhere).
+    fn selected_apps(&self) -> Vec<AppTarget> {
+        if !apps::supported() {
+            return Vec::new();
+        }
+        self.settings
+            .selected
+            .iter()
+            .filter_map(|k| AppTarget::from_key(k))
+            .collect()
+    }
+
+    fn selected_count(&self) -> usize {
+        self.devices
+            .iter()
+            .filter(|d| self.settings.selected.contains(&d.key()))
+            .count()
+            + self.selected_apps().len()
     }
 
     fn rescan_sessions(&mut self) {
@@ -201,6 +268,20 @@ impl MultiRecorderApp {
                     loopback: d.loopback,
                 }),
             })
+            .chain(self.selected_apps().into_iter().filter_map(|t| {
+                let source = AppSource::new(&t)
+                    .inspect_err(|e| log::warn!("{}: {e}", t.track_name()))
+                    .ok()?;
+                Some(TrackSpec {
+                    device_name: t.track_name(),
+                    device_id: t.key(),
+                    sample_rate: apps::APP_SAMPLE_RATE,
+                    channels: apps::APP_CHANNELS,
+                    // Silent while the app is quiet, like an output device.
+                    loopback: true,
+                    source: Box::new(source),
+                })
+            }))
             .collect()
     }
 
@@ -314,17 +395,29 @@ impl MultiRecorderApp {
         ui.add_space(6.0);
         ui.horizontal(|ui| {
             ui.strong("Input devices");
-            if ui.button("Refresh").clicked() {
+            let looking = self.devices_lookup.as_ref().map(|l| l.started.elapsed());
+            if ui
+                .add_enabled(looking.is_none(), egui::Button::new("Refresh"))
+                .clicked()
+            {
                 self.refresh_devices();
             }
             ui.checkbox(&mut self.settings.only_selected, "Show only selected");
+            if let Some(waited) = looking {
+                ui.spinner();
+                ui.weak(if waited < Duration::from_secs(5) {
+                    "Looking for devices…"
+                } else {
+                    "Still waiting for the audio drivers to answer…"
+                });
+            }
         });
         let visible: Vec<&InputDeviceInfo> = self
             .devices
             .iter()
             .filter(|d| !self.settings.only_selected || self.settings.selected.contains(&d.key()))
             .collect();
-        if !visible.iter().any(|d| !d.loopback) {
+        if !visible.iter().any(|d| !d.loopback) && self.devices_lookup.is_none() {
             ui.weak(if self.settings.only_selected {
                 "No input devices selected."
             } else {
@@ -353,6 +446,10 @@ impl MultiRecorderApp {
         if hidden > 0 {
             ui.weak(format!("{hidden} unselected device(s) hidden"));
         }
+        if apps::supported() {
+            ui.add_space(6.0);
+            self.apps_ui(ui);
+        }
         if let Some((key, on)) = toggled {
             if on {
                 self.settings.selected.insert(key);
@@ -360,6 +457,85 @@ impl MultiRecorderApp {
                 self.settings.selected.remove(&key);
             }
         }
+    }
+
+    /// "Apps" section: record one program, or everything except one. Nothing
+    /// runs (not even the listing) until the section is opened.
+    fn apps_ui(&mut self, ui: &mut egui::Ui) {
+        let selected = self.selected_apps();
+        egui::CollapsingHeader::new(egui::RichText::new("Apps (experimental)").strong())
+            .default_open(!selected.is_empty())
+            .show(ui, |ui| {
+                if self.apps.is_none() {
+                    self.refresh_apps();
+                }
+                ui.weak(
+                    "Records one program's sound, even when it switches devices, \
+                     or everything except one program. Needs Windows 11 or a recent \
+                     Windows 10. Runs in a separate helper, so a problem here can't \
+                     stop other tracks.",
+                );
+                ui.horizontal(|ui| {
+                    let looking = self.apps_lookup.is_some();
+                    if ui
+                        .add_enabled(!looking, egui::Button::new("Refresh"))
+                        .clicked()
+                    {
+                        self.refresh_apps();
+                    }
+                    if looking {
+                        ui.spinner();
+                    }
+                    if let Some(Err(e)) = &self.apps {
+                        ui.colored_label(RED, format!("Cannot list apps: {e}"));
+                    }
+                });
+                // Apps with sound now, plus selected ones that aren't running.
+                let mut rows: Vec<(String, &str)> = Vec::new();
+                if let Some(Ok(list)) = &self.apps {
+                    for a in list {
+                        rows.push((a.exe.clone(), if a.playing { "playing" } else { "quiet" }));
+                    }
+                }
+                for t in &selected {
+                    if !rows.iter().any(|(exe, _)| exe.eq_ignore_ascii_case(&t.exe)) {
+                        rows.push((t.exe.clone(), "not running"));
+                    }
+                }
+                if rows.is_empty() && self.apps_lookup.is_none() {
+                    ui.weak("No programs are using audio right now.");
+                }
+                let mut toggled = None;
+                egui::Grid::new("apps").num_columns(3).show(ui, |ui| {
+                    for (exe, state) in rows {
+                        for exclude in [false, true] {
+                            let target = AppTarget {
+                                exe: exe.clone(),
+                                exclude,
+                            };
+                            let key = target.key();
+                            let mut on = self.settings.selected.contains(&key);
+                            let label = if exclude {
+                                format!("everything except {}", target.app_name())
+                            } else {
+                                target.app_name().to_string()
+                            };
+                            if ui.checkbox(&mut on, label).changed() {
+                                toggled = Some((key, on));
+                            }
+                        }
+                        ui.weak(state);
+                        ui.end_row();
+                    }
+                });
+                if let Some((key, on)) = toggled {
+                    if on {
+                        self.settings.selected.insert(key);
+                    } else {
+                        self.settings.selected.remove(&key);
+                    }
+                }
+            });
     }
 
     fn open_logs(&mut self, select: Option<PathBuf>) {
@@ -494,11 +670,7 @@ impl MultiRecorderApp {
         ui.add_space(4.0);
         match &self.phase {
             Phase::Idle => {
-                let count = self
-                    .devices
-                    .iter()
-                    .filter(|d| self.settings.selected.contains(&d.key()))
-                    .count();
+                let count = self.selected_count();
                 let button = egui::Button::new(egui::RichText::new("●  Record").size(18.0));
                 ui.horizontal(|ui| {
                     if ui.add_enabled(count > 0, button).clicked() {
@@ -1084,6 +1256,14 @@ impl eframe::App for MultiRecorderApp {
         if !matches!(self.phase, Phase::Idle) {
             // Keep meters and status fresh; recording itself does not depend on the UI running.
             ctx.request_repaint_after(Duration::from_millis(66));
+        }
+        if let Some(devices) = self.devices_lookup.as_ref().and_then(Lookup::poll) {
+            self.devices = devices;
+            self.devices_lookup = None;
+        }
+        if let Some(apps) = self.apps_lookup.as_ref().and_then(Lookup::poll) {
+            self.apps = Some(apps);
+            self.apps_lookup = None;
         }
         if let Phase::Recording(rec) = &self.phase {
             for line in rec.take_events() {
