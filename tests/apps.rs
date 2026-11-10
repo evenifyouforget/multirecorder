@@ -189,3 +189,36 @@ fn app_not_available_waits_and_quiet_app_is_not_a_failure() {
     let log = std::fs::read_to_string(dir.join(session::LOG_FILE)).unwrap();
     assert_eq!(log.matches("Firefox is not running").count(), 1, "{log}");
 }
+
+/// The real Windows helper, on CI's Windows machine (which may have no audio
+/// devices): it must answer cleanly, never crash or hang.
+#[cfg(windows)]
+#[test]
+fn windows_helper_answers_cleanly() {
+    use std::process::Command;
+    let exe = env!("CARGO_BIN_EXE_multirecorder");
+    let run = |args: &[&str]| {
+        let out = Command::new(exe).args(args).output().unwrap();
+        (out.status.code(), out.stdout)
+    };
+    // Listing: JSON lines, or one "error:" line if there's no audio service.
+    let (code, stdout) = run(&[multirecorder::apps::LIST_ARG]);
+    let text = String::from_utf8_lossy(&stdout);
+    assert!(matches!(code, Some(0 | 1)), "{code:?}: {text}");
+    for line in text.lines() {
+        assert!(
+            line.starts_with("error: ") || line.starts_with('{'),
+            "unexpected line: {line}"
+        );
+    }
+    // Capturing an app that isn't running fails with a readable message.
+    let (code, stdout) = run(&[
+        multirecorder::apps::CAPTURE_ARG,
+        "include",
+        "no-such-app-4f2a.exe",
+    ]);
+    assert_eq!(code, Some(1));
+    assert_eq!(stdout[0], b'F');
+    let msg = String::from_utf8_lossy(&stdout[5..]);
+    assert_eq!(msg, "no-such-app-4f2a is not running");
+}
