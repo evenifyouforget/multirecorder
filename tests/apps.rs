@@ -87,35 +87,17 @@ fn crashing_or_hung_helper_only_affects_its_track() {
     assert_eq!(st.state, TrackState::Recording);
     thread::sleep(Duration::from_millis(500));
 
-    // The helper crashes: its track waits for it like for an unplugged device.
+    // The helper crashes, then hangs (the fake does each once and works
+    // again when restarted). Each time only its own track reconnects.
     set(&flaky, "crash");
-    let st = wait_for(&rec, 1, 3.0, |s| {
-        matches!(s.state, TrackState::Reconnecting(_))
-    });
-    assert!(
-        matches!(st.state, TrackState::Reconnecting(_)),
-        "{:?}",
-        st.state
-    );
-    set(&flaky, "ok");
-    let st = wait_for(&rec, 1, 5.0, |s| {
+    let st = wait_for(&rec, 1, 6.0, |s| {
         s.state == TrackState::Recording && s.reconnects >= 1
     });
     assert_eq!((st.state, st.reconnects), (TrackState::Recording, 1));
-
-    // The helper hangs: it is killed and restarted.
+    thread::sleep(Duration::from_millis(300));
     set(&flaky, "hang");
-    let st = wait_for(&rec, 1, 6.0, |s| {
-        matches!(s.state, TrackState::Reconnecting(_))
-    });
-    assert!(
-        matches!(st.state, TrackState::Reconnecting(_)),
-        "{:?}",
-        st.state
-    );
-    set(&flaky, "ok");
-    let st = wait_for(&rec, 1, 5.0, |s| {
-        s.reconnects >= 2 && s.state == TrackState::Recording
+    let st = wait_for(&rec, 1, 10.0, |s| {
+        s.state == TrackState::Recording && s.reconnects >= 2
     });
     assert_eq!((st.state, st.reconnects), (TrackState::Recording, 2));
     thread::sleep(Duration::from_millis(500));

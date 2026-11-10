@@ -501,6 +501,8 @@ fn capture_main(_target: &AppTarget, out: &mut FrameWriter<impl Write>) -> i32 {
 /// word picks the behaviour and is re-read every tick:
 /// `ok`, `silent` (heartbeats only, like a paused app), `hang` (stops
 /// writing), `crash` (exits abruptly), `fail <message>` (fatal message).
+/// `hang` and `crash` happen once: they reset the file to `ok` first, so the
+/// restarted helper works.
 fn fake_main(control: &PathBuf, out: &mut FrameWriter<impl Write>) -> i32 {
     let started = Instant::now();
     let rate = f64::from(APP_SAMPLE_RATE);
@@ -514,10 +516,16 @@ fn fake_main(control: &PathBuf, out: &mut FrameWriter<impl Write>) -> i32 {
         let mut words = mode.split_whitespace();
         let due = (started.elapsed().as_secs_f64() * rate) as u64;
         let result = match words.next().unwrap_or("ok") {
-            "crash" => std::process::exit(3),
-            "hang" => loop {
-                thread::sleep(Duration::from_secs(1));
-            },
+            "crash" => {
+                let _ = std::fs::write(control, "ok");
+                std::process::exit(3)
+            }
+            "hang" => {
+                let _ = std::fs::write(control, "ok");
+                loop {
+                    thread::sleep(Duration::from_secs(1));
+                }
+            }
             "fail" => {
                 let msg: Vec<&str> = words.collect();
                 let _ = out.fatal(&msg.join(" "));
