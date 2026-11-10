@@ -29,8 +29,11 @@ const NO_SIGNAL_SECS: f64 = 5.0;
 pub struct Warnings {
     /// Repeated short dropouts in the recent past.
     pub choppy: bool,
-    /// Dropouts detected since recording started.
+    /// Dropouts detected since recording started, including `gaps`.
     pub dropouts: u64,
+    /// Dropouts where the device delivered nothing for a moment (rather than
+    /// delivering digital silence); the recorder fills these with silence.
+    pub gaps: u64,
     /// Clipping in the recent past.
     pub clipping: bool,
     /// Clipping events since recording started.
@@ -59,6 +62,7 @@ pub struct Analyzer {
     zero_run_after_signal: bool,
     recent_dropouts: VecDeque<u64>,
     dropouts: u64,
+    gaps: u64,
     choppy_until: u64,
     clip_runs: Vec<u32>,
     clip_events: u64,
@@ -79,6 +83,7 @@ impl Analyzer {
             zero_run_after_signal: false,
             recent_dropouts: VecDeque::new(),
             dropouts: 0,
+            gaps: 0,
             choppy_until: 0,
             clip_runs: vec![0; channels],
             clip_events: 0,
@@ -160,6 +165,16 @@ impl Analyzer {
         self.pos += 1;
     }
 
+    /// The device delivered nothing for a moment while its stream kept
+    /// running. Counts as a dropout, at the current position.
+    pub fn delivery_gap(&mut self) {
+        self.gaps += 1;
+        self.dropout();
+        // Zeros before the gap and audio after it are not one dropout.
+        self.zero_run = 0;
+        self.zero_run_after_signal = false;
+    }
+
     fn dropout(&mut self) {
         self.dropouts += 1;
         self.recent_dropouts.push_back(self.pos);
@@ -187,6 +202,7 @@ impl Analyzer {
         Warnings {
             choppy: self.pos < self.choppy_until,
             dropouts: self.dropouts,
+            gaps: self.gaps,
             clipping: self.pos < self.clipping_until,
             clip_events: self.clip_events,
             no_signal: self.pos - self.last_signal >= self.frames(NO_SIGNAL_SECS),
@@ -307,6 +323,21 @@ mod tests {
         let w = a.warnings();
         assert!(!w.choppy);
         assert_eq!(w.dropouts, 1);
+    }
+
+    #[test]
+    fn delivery_gaps_count_as_dropouts() {
+        let mut a = Analyzer::new(1, RATE);
+        a.process(&tone(secs(0.5), 1, 0.5));
+        a.delivery_gap();
+        a.process(&tone(secs(0.5), 1, 0.5));
+        let w = a.warnings();
+        assert_eq!((w.dropouts, w.gaps, w.choppy), (1, 1, false));
+        a.delivery_gap();
+        a.process(&tone(secs(0.2), 1, 0.5));
+        a.delivery_gap();
+        let w = a.warnings();
+        assert_eq!((w.dropouts, w.gaps, w.choppy), (3, 3, true));
     }
 
     #[test]

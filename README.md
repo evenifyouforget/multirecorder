@@ -53,7 +53,7 @@ won't show up.
 
 | Warning | Meaning |
 |---|---|
-| ⚠ choppy | Repeated short gaps of digital silence (3+ within 3 s): usually a driver, USB or buffer problem. |
+| ⚠ choppy | Repeated dropouts (3+ within 3 s): short gaps of digital silence, or moments where the device sent no audio at all. Usually a driver, USB or buffer problem. |
 | ⚠ clipping | The signal hits full scale and is distorted; lower the input gain. |
 | no signal | Nothing above -80 dBFS for 5 s. Fine if the source is meant to be silent. |
 | reconnecting | The device is missing; its track is being filled with silence. |
@@ -72,6 +72,9 @@ keep up and gaps are likely.
 - All tracks share one timeline. If a device disconnects, stalls, or can't keep
   up, its track is filled with silence, and it is reopened automatically when it
   comes back. Tracks always line up and end with equal length.
+- A device that stops sending audio for a moment (0.1 to 2 s) keeps its
+  stream; the gap is logged and filled with silence so the audio after it stays
+  in sync. Audio a driver merely delivers late, in a burst, is not a gap.
 - Audio is captured to headerless raw files (`*.f32`) flushed to disk every
   second, so a crash loses at most about a second. Interrupted sessions are
   listed at startup and can be exported from there.
