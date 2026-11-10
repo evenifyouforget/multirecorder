@@ -49,6 +49,13 @@ the output folder (a few KB; no audio). It sees what the device delivers to the
 computer, so problems later in the chain (e.g. in OBS's encoder or upload)
 won't show up.
 
+### Logs
+
+**Logs** (top right) lists the logs of past recordings and monitoring in the
+output folder, newest first, and shows the selected one; the current session's
+log follows along while it runs (**Log** button). Text can be selected and
+copied, or copied whole with **Copy all**.
+
 ### Lining up recordings from several computers
 
 Every recording notes when it started, to the millisecond. 0:00 in every track
