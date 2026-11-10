@@ -162,6 +162,7 @@ fn test_config() -> RecorderConfig {
         poll_interval: Duration::from_millis(5),
         idle_gap: Duration::from_millis(100),
         gap_threshold: Duration::from_millis(60),
+        gap_confirm: Duration::from_millis(300),
         live_export: None,
     }
 }
@@ -383,7 +384,8 @@ fn short_delivery_gap_is_filled_and_reported() {
     thread::sleep(Duration::from_millis(180));
     let on = at(&rec);
     gappy.set(Mode::Ok);
-    thread::sleep(Duration::from_millis(500));
+    // The gap is confirmed `gap_confirm` after audio resumes.
+    thread::sleep(Duration::from_millis(900));
     let statuses = rec.statuses();
     let st = &statuses[1].1;
     assert_eq!(st.state, TrackState::Recording);

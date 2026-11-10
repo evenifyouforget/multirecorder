@@ -46,6 +46,11 @@ pub struct RecorderConfig {
     /// less than `stall_timeout`) has a gap: it is logged and filled with
     /// silence, so later audio stays in sync.
     pub gap_threshold: Duration,
+    /// A possible gap is only filled once the audio after it has stopped
+    /// catching up for this long. Drivers sometimes deliver held-back audio
+    /// slowly, or pause briefly while doing so; filling too early would push
+    /// the track ahead. Waiting longer only delays the decision.
+    pub gap_confirm: Duration,
     /// Export to this format alongside the recording, so stopping is quick.
     pub live_export: Option<ExportFormat>,
 }
@@ -60,6 +65,7 @@ impl Default for RecorderConfig {
             poll_interval: Duration::from_millis(15),
             idle_gap: Duration::from_millis(100),
             gap_threshold: Duration::from_millis(100),
+            gap_confirm: Duration::from_millis(500),
             live_export: None,
         }
     }
@@ -553,7 +559,7 @@ enum GapCheck {
 /// audio arrives again. Drivers often deliver delayed audio late, quickly or
 /// slowly; while they catch up the jump keeps shrinking. So a jump only
 /// counts once it has stopped shrinking for `confirm` (or after `max_hold`,
-/// well within the ring buffer). The baseline follows slow clock drift: it
+/// half the ring buffer). The baseline follows slow clock drift: it
 /// rises with the lag at once and sinks slowly, which also forgets startup
 /// latency.
 struct GapDetector {
@@ -578,12 +584,12 @@ struct Suspect {
 }
 
 impl GapDetector {
-    fn new(threshold: Duration, sample_rate: u32) -> Self {
+    fn new(threshold: Duration, confirm: Duration, max_hold: Duration, sample_rate: u32) -> Self {
         let rate = f64::from(sample_rate);
         Self {
             threshold: threshold.as_secs_f64() * rate,
-            confirm: threshold,
-            max_hold: Duration::from_secs(1),
+            confirm,
+            max_hold: max_hold.max(confirm),
             tolerance: threshold.as_secs_f64() * rate / 2.0,
             sink_rate: 0.01 * rate,
             base: None,
@@ -808,7 +814,13 @@ impl TrackWorker {
         let mut warnings = Warnings::default();
         let mut reported = Warnings::default();
         let mut last_events = Instant::now();
-        let mut gaps = GapDetector::new(self.config.gap_threshold, self.sample_rate);
+        // Holding audio back must stay well within the ring buffer.
+        let mut gaps = GapDetector::new(
+            self.config.gap_threshold,
+            self.config.gap_confirm,
+            self.config.buffer / 2,
+            self.sample_rate,
+        );
         let mut gap_log = GapLog::default();
         let mut levels = vec![0.0f32; usize::from(self.channels)];
         let mut last_meter = Instant::now();
