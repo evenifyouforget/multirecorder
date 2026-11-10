@@ -203,10 +203,17 @@ impl AppSource {
 }
 
 /// A running helper; dropping it stops (kills) the helper.
+///
+/// Stopping never waits for the reader thread: if another process inherited
+/// the pipe (possible on macOS, where pipes become close-on-exec in a second
+/// step), the pipe never reports its end and the reader blocks until that
+/// process exits. A stuck reader is left behind instead of stalling the
+/// track's worker thread.
 struct AppStream {
     child: Arc<Mutex<Child>>,
     stopping: Arc<AtomicBool>,
-    threads: Vec<JoinHandle<()>>,
+    reader: Option<JoinHandle<()>>,
+    watchdog: Option<JoinHandle<()>>,
 }
 
 impl Drop for AppStream {
@@ -216,10 +223,24 @@ impl Drop for AppStream {
             let _ = child.kill();
             let _ = child.wait();
         }
-        for t in self.threads.drain(..) {
+        if let Some(t) = self.watchdog.take() {
             let _ = t.join();
         }
+        if let Some(t) = self.reader.take() {
+            let deadline = Instant::now() + Duration::from_millis(500);
+            while !t.is_finished() && Instant::now() < deadline {
+                thread::sleep(Duration::from_millis(10));
+            }
+            if t.is_finished() {
+                let _ = t.join();
+            }
+        }
     }
+}
+
+/// Exit status if the helper has exited.
+fn exited(child: &Mutex<Child>) -> Option<std::process::ExitStatus> {
+    child.lock().ok()?.try_wait().ok().flatten()
 }
 
 enum Started {
@@ -240,9 +261,16 @@ impl InputSource for AppSource {
         let last_seen = Arc::new(AtomicU64::new(0));
         let (started_tx, started_rx) = mpsc::channel();
         let watchdog_events = sink.events.clone();
+        // The reader and the watchdog may both notice a failure; report once.
+        let reported = Arc::new(AtomicBool::new(false));
 
         let reader = {
-            let (child, stopping, last_seen) = (child.clone(), stopping.clone(), last_seen.clone());
+            let (child, stopping, last_seen, reported) = (
+                child.clone(),
+                stopping.clone(),
+                last_seen.clone(),
+                reported.clone(),
+            );
             let events = sink.events.clone();
             thread::Builder::new()
                 .name("app-capture-reader".into())
@@ -301,8 +329,9 @@ impl InputSource for AppSource {
                         return;
                     }
                     let message = fatal.unwrap_or_else(|| {
-                        let status = child.lock().ok().and_then(|mut c| c.wait().ok());
-                        match status {
+                        // The pipe ended, so the helper is exiting.
+                        thread::sleep(Duration::from_millis(50));
+                        match exited(&child) {
                             Some(s) => format!("capture helper stopped ({s})"),
                             None => "capture helper stopped".into(),
                         }
@@ -312,10 +341,12 @@ impl InputSource for AppSource {
                             let _ = tx.send(Started::Failed(message));
                         }
                         None => {
-                            let _ = events.send(StreamEvent {
-                                fatal: true,
-                                message,
-                            });
+                            if !reported.swap(true, Ordering::Relaxed) {
+                                let _ = events.send(StreamEvent {
+                                    fatal: true,
+                                    message,
+                                });
+                            }
                         }
                     }
                 })
@@ -325,12 +356,32 @@ impl InputSource for AppSource {
         let mut stream = AppStream {
             child: child.clone(),
             stopping: stopping.clone(),
-            threads: vec![reader],
+            reader: Some(reader),
+            watchdog: None,
         };
-        match started_rx.recv_timeout(START_TIMEOUT) {
-            Ok(Started::Ok) => {}
-            Ok(Started::Failed(msg)) => return Err(msg),
-            Err(_) => return Err("capture helper did not start".into()),
+        let start_deadline = Instant::now() + START_TIMEOUT;
+        loop {
+            match started_rx.recv_timeout(Duration::from_millis(100)) {
+                Ok(Started::Ok) => break,
+                Ok(Started::Failed(msg)) => return Err(msg),
+                Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    return Err("capture helper stopped".into());
+                }
+                Err(mpsc::RecvTimeoutError::Timeout) => {}
+            }
+            // Don't rely on the pipe ending (see `AppStream`): check the process.
+            if let Some(status) = exited(&child) {
+                // Its last message may still be on the way.
+                if let Ok(Started::Failed(msg)) =
+                    started_rx.recv_timeout(Duration::from_millis(200))
+                {
+                    return Err(msg);
+                }
+                return Err(format!("capture helper stopped ({status})"));
+            }
+            if Instant::now() > start_deadline {
+                return Err("capture helper did not start".into());
+            }
         }
 
         let watchdog = {
@@ -341,22 +392,31 @@ impl InputSource for AppSource {
                     while !stopping.load(Ordering::Relaxed) {
                         thread::sleep(Duration::from_millis(100));
                         let seen = Duration::from_millis(last_seen.load(Ordering::Relaxed));
-                        if opened.elapsed().saturating_sub(seen) > HUNG_AFTER {
+                        let failure = if let Some(status) = exited(&child) {
+                            // Give the reader a moment to deliver the helper's
+                            // own last words (an `F` message) first.
+                            thread::sleep(Duration::from_millis(200));
+                            format!("capture helper stopped ({status})")
+                        } else if opened.elapsed().saturating_sub(seen) > HUNG_AFTER {
+                            "capture helper not responding".into()
+                        } else {
+                            continue;
+                        };
+                        if !reported.swap(true, Ordering::Relaxed) {
                             let _ = events.send(StreamEvent {
                                 fatal: true,
-                                message: "capture helper not responding".into(),
+                                message: failure,
                             });
-                            stopping.store(true, Ordering::Relaxed);
-                            if let Ok(mut c) = child.lock() {
-                                let _ = c.kill();
-                            }
-                            return;
                         }
+                        if let Ok(mut c) = child.lock() {
+                            let _ = c.kill();
+                        }
+                        return;
                     }
                 })
                 .map_err(|e| e.to_string())?
         };
-        stream.threads.push(watchdog);
+        stream.watchdog = Some(watchdog);
         Ok(Box::new(stream))
     }
 }
@@ -445,7 +505,11 @@ pub fn run_helper(args: &[String]) -> Option<i32> {
         }
         FAKE_ARG => {
             let mut out = FrameWriter::new(stdout);
-            match args.get(2) {
+            match args.get(2).map(String::as_str) {
+                Some("--sleep") => {
+                    thread::sleep(Duration::from_secs(15));
+                    0
+                }
                 Some(control) => fake_main(&PathBuf::from(control), &mut out),
                 None => 2,
             }
@@ -501,8 +565,10 @@ fn capture_main(_target: &AppTarget, out: &mut FrameWriter<impl Write>) -> i32 {
 /// word picks the behaviour and is re-read every tick:
 /// `ok`, `silent` (heartbeats only, like a paused app), `hang` (stops
 /// writing), `crash` (exits abruptly), `fail <message>` (fatal message).
-/// `hang` and `crash` happen once: they reset the file to `ok` first, so the
-/// restarted helper works.
+/// `crash-leak` crashes after starting a process that inherits the output
+/// pipe and keeps it open for a while, as can happen on macOS when two
+/// helpers start at once. `hang`, `crash` and `crash-leak` happen once: they
+/// reset the file to `ok` first, so the restarted helper works.
 fn fake_main(control: &PathBuf, out: &mut FrameWriter<impl Write>) -> i32 {
     let started = Instant::now();
     let rate = f64::from(APP_SAMPLE_RATE);
@@ -518,6 +584,18 @@ fn fake_main(control: &PathBuf, out: &mut FrameWriter<impl Write>) -> i32 {
         let result = match words.next().unwrap_or("ok") {
             "crash" => {
                 let _ = std::fs::write(control, "ok");
+                std::process::exit(3)
+            }
+            "crash-leak" => {
+                let _ = std::fs::write(control, "ok");
+                if let Ok(exe) = std::env::current_exe() {
+                    // Inherits stdout (the pipe to the recorder) and sleeps.
+                    let _ = Command::new(exe)
+                        .args([FAKE_ARG, "--sleep"])
+                        .stdin(Stdio::null())
+                        .stderr(Stdio::null())
+                        .spawn();
+                }
                 std::process::exit(3)
             }
             "hang" => {

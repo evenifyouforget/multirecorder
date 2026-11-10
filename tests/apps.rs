@@ -115,6 +115,27 @@ fn crashing_or_hung_helper_only_affects_its_track() {
         "{}",
         log_of(&rec)
     );
+    // The helper crashes while another process still holds its pipe open, so
+    // the pipe never ends: the exit itself must be noticed, without waiting
+    // for the hang timeout, and stopping the old helper must not block.
+    thread::sleep(Duration::from_millis(300));
+    let crashed = std::time::Instant::now();
+    set(&flaky, "crash-leak");
+    let st = wait_for(&rec, 1, 10.0, |s| {
+        s.state == TrackState::Recording && s.reconnects >= 3
+    });
+    assert_eq!(
+        (st.state, st.reconnects),
+        (TrackState::Recording, 3),
+        "{}",
+        log_of(&rec)
+    );
+    assert!(
+        crashed.elapsed() < Duration::from_millis(2500),
+        "noticed after {:?}: {}",
+        crashed.elapsed(),
+        log_of(&rec)
+    );
     thread::sleep(Duration::from_millis(500));
 
     let steady_st = rec.statuses()[0].1.clone();
