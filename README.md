@@ -38,6 +38,25 @@ choose **Open** the first time. The Linux build needs ALSA (`libasound2`).
 
 Each device records at its own native sample rate and channel count.
 
+### Recording individual apps (experimental, Windows)
+
+Open **Apps (experimental)** under the device list to see the programs using
+audio. Tick one, e.g. *firefox*, to record only its sound on its own track,
+or *everything except discord* to record all other sound (e.g. desktop audio
+without your friends' voices). An app track:
+
+- follows the program, not a device: it keeps working when the program
+  switches output device or recreates its audio stream (e.g. on pause/play);
+- is silent while the program is quiet, and reconnects if the program is
+  closed and started again;
+- is always 48 kHz stereo.
+
+It needs Windows 11 or a recent Windows 10; on older versions the track says
+why it can't start. The capture runs in a separate helper process, so if it
+crashes or hangs, only that track is affected: it shows *reconnecting* and is
+filled with silence while the helper is restarted, like an unplugged device.
+Nothing of this runs unless an app is ticked.
+
 ### Monitor only
 
 **Monitor only…** runs the same checks as a recording (meters, warnings,
