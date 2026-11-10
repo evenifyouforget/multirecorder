@@ -79,14 +79,19 @@ impl InputSource for FakeSource {
         let thread = thread::spawn(move || {
             let opened = Instant::now();
             let mut sent = 0u64;
+            let mut last_tick = 0.0;
             while !stop2.load(Ordering::Relaxed) {
                 thread::sleep(Duration::from_millis(5));
-                let due = (opened.elapsed().as_secs_f64() * f64::from(rate)) as u64;
+                let now = opened.elapsed().as_secs_f64();
+                let tick = now - last_tick;
+                last_tick = now;
+                let due = (now * f64::from(rate)) as u64;
                 match control.get() {
                     Mode::Ok => {
-                        // A backlog (see `Held`) drains at up to 8x real
-                        // time, in several pieces, like a driver catching up.
-                        let frames = (due - sent).min(u64::from(rate) / 25);
+                        // A backlog (see `Held`) drains slowly, at twice real
+                        // time, like a driver catching up bit by bit.
+                        let allowance = (2.0 * tick * f64::from(rate)) as u64;
+                        let frames = (due - sent).min(allowance.max(1));
                         sink.push(
                             &vec![value; frames as usize * usize::from(channels)],
                             usize::from(channels),
@@ -429,11 +434,9 @@ fn late_burst_from_driver_is_not_a_gap() {
     assert_eq!(st.warnings.gaps, 0);
     let (dir, meta) = rec.stop(Duration::from_secs(5)).unwrap();
     let raw = read_raw(&dir.join(&meta.tracks[0].raw_file));
-    assert!(
-        seconds_of_silence(&raw, 1, 48_000) < 0.02,
-        "{:?}",
-        silence_span(&raw, 48_000)
-    );
+    // Silence before the device connected doesn't count.
+    let span = silence_span(&raw, 48_000);
+    assert!(span.1 < 0.02, "silence inserted: {span:?}");
 }
 
 #[test]

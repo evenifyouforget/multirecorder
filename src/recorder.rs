@@ -550,18 +550,31 @@ enum GapCheck {
 /// The lag (timeline position minus frames received) stays steady while a
 /// device delivers in real time; it only wobbles by a buffer period or so.
 /// A pause in delivery shows up as a jump in lag by the pause's length when
-/// audio arrives again. Drivers often deliver delayed audio in a burst, so a
-/// jump only counts once it has lasted `confirm`; by then a catch-up burst
-/// has shrunk it back. The baseline follows slow clock drift: it rises with
-/// the lag at once and sinks slowly, which also forgets startup latency.
+/// audio arrives again. Drivers often deliver delayed audio late, quickly or
+/// slowly; while they catch up the jump keeps shrinking. So a jump only
+/// counts once it has stopped shrinking for `confirm` (or after `max_hold`,
+/// well within the ring buffer). The baseline follows slow clock drift: it
+/// rises with the lag at once and sinks slowly, which also forgets startup
+/// latency.
 struct GapDetector {
     threshold: f64,
     confirm: Duration,
+    max_hold: Duration,
+    /// How much the jump must shrink to count as catching up (jitter margin).
+    tolerance: f64,
     /// Frames per second the baseline may sink.
     sink_rate: f64,
     base: Option<f64>,
     last: Instant,
-    suspect_since: Option<Instant>,
+    suspect: Option<Suspect>,
+}
+
+/// A jump in lag being watched.
+struct Suspect {
+    first: Instant,
+    /// When the jump last shrank, and to what.
+    shrank: Instant,
+    smallest: f64,
 }
 
 impl GapDetector {
@@ -570,17 +583,19 @@ impl GapDetector {
         Self {
             threshold: threshold.as_secs_f64() * rate,
             confirm: threshold,
+            max_hold: Duration::from_secs(1),
+            tolerance: threshold.as_secs_f64() * rate / 2.0,
             sink_rate: 0.01 * rate,
             base: None,
             last: Instant::now(),
-            suspect_since: None,
+            suspect: None,
         }
     }
 
     /// For a new stream, whose latency may differ.
     fn reset(&mut self) {
         self.base = None;
-        self.suspect_since = None;
+        self.suspect = None;
     }
 
     /// `lag` is measured when audio is waiting to be written. `force` decides
@@ -597,13 +612,24 @@ impl GapDetector {
         self.base = Some(base);
         let excess = lag - base;
         if excess < self.threshold {
-            self.suspect_since = None;
+            self.suspect = None;
             self.base = Some(base.max(lag));
             return GapCheck::Drain;
         }
-        let since = *self.suspect_since.get_or_insert(now);
-        if force || now.duration_since(since) >= self.confirm {
-            self.suspect_since = None;
+        let s = self.suspect.get_or_insert(Suspect {
+            first: now,
+            shrank: now,
+            smallest: excess,
+        });
+        if excess < s.smallest - self.tolerance {
+            s.smallest = excess;
+            s.shrank = now;
+        }
+        if force
+            || now.duration_since(s.shrank) >= self.confirm
+            || now.duration_since(s.first) >= self.max_hold
+        {
+            self.suspect = None;
             GapCheck::Fill(excess.round() as u64)
         } else {
             GapCheck::Hold
