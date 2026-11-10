@@ -582,13 +582,28 @@ fn choppy_device_raises_warning_and_meters_move() {
         test_config(),
     )
     .unwrap();
+    // About 7 dropouts in 1.5 s; a busy CI machine may deliver them later.
     thread::sleep(Duration::from_millis(1500));
-    let statuses = rec.statuses();
+    let deadline = Instant::now() + Duration::from_secs(4);
+    let statuses = loop {
+        let statuses = rec.statuses();
+        let w = &statuses[1].1.warnings;
+        if (w.choppy && w.dropouts >= 4) || Instant::now() > deadline {
+            break statuses;
+        }
+        thread::sleep(Duration::from_millis(50));
+    };
     let (ok_st, choppy_st) = (&statuses[0].1, &statuses[1].1);
     assert!(!ok_st.warnings.any_problem(), "{:?}", ok_st.warnings);
     assert!(ok_st.levels.iter().all(|&l| l > 0.3), "{:?}", ok_st.levels);
-    assert!(choppy_st.warnings.choppy, "{:?}", choppy_st.warnings);
-    assert!(choppy_st.warnings.dropouts >= 4);
+    let seen = format!(
+        "{:?} after {:.2} s, {:.2} s written",
+        choppy_st.warnings,
+        at(&rec),
+        choppy_st.frames_written as f64 / 48_000.0
+    );
+    assert!(choppy_st.warnings.choppy, "{seen}");
+    assert!(choppy_st.warnings.dropouts >= 4, "{seen}");
     let (dir, _) = rec.stop(Duration::from_secs(5)).unwrap();
     let log = std::fs::read_to_string(dir.join(session::LOG_FILE)).unwrap();
     assert!(log.contains("(choppy): WARNING choppy audio"), "{log}");
