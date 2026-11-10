@@ -12,6 +12,7 @@ use serde::{Deserialize, Serialize};
 use crate::analysis::{LevelHistory, Warnings};
 use crate::audio::{self, CpalSource, InputDeviceInfo};
 use crate::export::{self, ExportFormat};
+use crate::logs::{self, LogEntry};
 use crate::recorder::{Load, Recorder, RecorderConfig, TrackSpec, TrackState, TrackStatus};
 use crate::resources;
 use crate::session::{self, SessionMeta};
@@ -77,6 +78,58 @@ pub struct MultiRecorderApp {
     resources: Option<(Instant, Option<u64>, Option<u64>)>,
     /// Low-disk warning already shown for this recording.
     warned_low_disk: bool,
+    /// The log viewer window, when open.
+    log_viewer: Option<LogViewer>,
+}
+
+/// Lists the logs in the output folder and shows one, refreshed while open
+/// so the current session's log follows along.
+struct LogViewer {
+    logs: Vec<LogEntry>,
+    selected: Option<PathBuf>,
+    text: String,
+    listed: Instant,
+    loaded: Instant,
+}
+
+impl LogViewer {
+    fn new(root: &Path, select: Option<PathBuf>) -> Self {
+        let logs = logs::find_logs(root);
+        let selected = select.or_else(|| logs.first().map(|l| l.path.clone()));
+        let mut viewer = Self {
+            logs,
+            selected: None,
+            text: String::new(),
+            listed: Instant::now(),
+            loaded: Instant::now(),
+        };
+        viewer.select(selected);
+        viewer
+    }
+
+    fn select(&mut self, path: Option<PathBuf>) {
+        self.selected = path;
+        self.reload();
+    }
+
+    fn reload(&mut self) {
+        self.loaded = Instant::now();
+        self.text = match &self.selected {
+            Some(path) => logs::read_log(path)
+                .unwrap_or_else(|e| format!("Cannot read {}: {e}", path.display())),
+            None => "No logs in the output folder yet.".into(),
+        };
+    }
+
+    fn refresh(&mut self, root: &Path) {
+        if self.listed.elapsed() >= Duration::from_secs(3) {
+            self.logs = logs::find_logs(root);
+            self.listed = Instant::now();
+        }
+        if self.loaded.elapsed() >= Duration::from_secs(1) {
+            self.reload();
+        }
+    }
 }
 
 impl MultiRecorderApp {
@@ -96,6 +149,7 @@ impl MultiRecorderApp {
             last_session: None,
             resources: None,
             warned_low_disk: false,
+            log_viewer: None,
         };
         app.refresh_devices();
         app.rescan_sessions();
@@ -308,6 +362,126 @@ impl MultiRecorderApp {
         }
     }
 
+    fn open_logs(&mut self, select: Option<PathBuf>) {
+        self.log_viewer = Some(LogViewer::new(Path::new(&self.settings.output_dir), select));
+    }
+
+    fn logs_window(&mut self, ctx: &egui::Context) {
+        let root = PathBuf::from(&self.settings.output_dir);
+        let current = match &self.phase {
+            Phase::Recording(rec) => Some(rec.log_path().to_path_buf()),
+            _ => None,
+        };
+        let Some(viewer) = self.log_viewer.as_mut() else {
+            return;
+        };
+        viewer.refresh(&root);
+        let mut open = true;
+        let mut select = None;
+        let mut message = None;
+        let mut open_dir = None;
+        let screen = ctx.content_rect().size();
+        egui::Window::new("Logs")
+            .open(&mut open)
+            .default_size([(screen.x - 40.0).min(900.0), (screen.y - 80.0).min(520.0)])
+            .resizable(true)
+            .collapsible(false)
+            .show(ctx, |ui| {
+                ui.horizontal_top(|ui| {
+                    egui::ScrollArea::vertical()
+                        .id_salt("log_list")
+                        .max_width(240.0)
+                        .auto_shrink([false, false])
+                        .show(ui, |ui| {
+                            ui.set_width(220.0);
+                            ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Truncate);
+                            if viewer.logs.is_empty() {
+                                ui.weak("No logs yet.");
+                            }
+                            ui.vertical(|ui| {
+                                for entry in &viewer.logs {
+                                    let mut label = entry.name.clone();
+                                    if current.as_ref() == Some(&entry.path) {
+                                        label.push_str("  (now)");
+                                    }
+                                    let selected = viewer.selected.as_ref() == Some(&entry.path);
+                                    if ui.selectable_label(selected, label).clicked() && !selected {
+                                        select = Some(entry.path.clone());
+                                    }
+                                }
+                            });
+                        });
+                    ui.separator();
+                    ui.vertical(|ui| {
+                        let entry = viewer
+                            .logs
+                            .iter()
+                            .find(|l| Some(&l.path) == viewer.selected.as_ref());
+                        if let Some(start) = entry
+                            .and_then(|e| e.started_at.as_deref())
+                            .and_then(session::parse_start)
+                        {
+                            ui.horizontal(|ui| {
+                                let text = session::format_start(&start);
+                                ui.label("Start time (0:00 in every track):");
+                                ui.add(
+                                    egui::Label::new(egui::RichText::new(&text).monospace())
+                                        .truncate(),
+                                );
+                                if ui.small_button("Copy").clicked() {
+                                    ui.ctx().copy_text(text.clone());
+                                    message = Some(format!("Copied start time: {text}"));
+                                }
+                            });
+                        }
+                        ui.horizontal(|ui| {
+                            if ui.button("Copy all").clicked() {
+                                ui.ctx().copy_text(viewer.text.clone());
+                            }
+                            if let Some(path) = &viewer.selected {
+                                if ui.button("Open folder").clicked() {
+                                    open_dir = path.parent().map(Path::to_path_buf);
+                                }
+                                ui.add(
+                                    egui::Label::new(
+                                        egui::RichText::new(path.display().to_string()).weak(),
+                                    )
+                                    .truncate(),
+                                );
+                            }
+                        });
+                        egui::ScrollArea::vertical()
+                            .id_salt("log_text")
+                            .auto_shrink([false, false])
+                            .show(ui, |ui| {
+                                // A &str buffer: selectable and copyable, not
+                                // editable. Long lines wrap.
+                                ui.add(
+                                    egui::TextEdit::multiline(&mut viewer.text.as_str())
+                                        .font(egui::TextStyle::Monospace)
+                                        .desired_width(ui.available_width()),
+                                );
+                            });
+                    });
+                });
+            });
+        if let Some(path) = select {
+            viewer.select(Some(path));
+        }
+        if !open {
+            self.log_viewer = None;
+        } else {
+            // Follow the current session's log.
+            ctx.request_repaint_after(Duration::from_secs(1));
+        }
+        if let Some(msg) = message {
+            self.message(msg);
+        }
+        if let Some(dir) = open_dir {
+            self.open_folder(dir);
+        }
+    }
+
     fn open_folder(&mut self, path: PathBuf) {
         if let Err(e) = open_folder(&path) {
             self.message(format!("Could not open {}: {e}", path.display()));
@@ -338,17 +512,25 @@ impl MultiRecorderApp {
                         self.confirm_monitor = true;
                     }
                     ui.label(format!("{count} device(s) selected"));
-                    if let Some(dir) = self.last_session.clone() {
-                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            if ui.button("Open last session").clicked() {
-                                self.open_folder(dir);
-                            }
-                        });
-                    }
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if let Some(dir) = self.last_session.clone()
+                            && ui.button("Open last session").clicked()
+                        {
+                            self.open_folder(dir);
+                        }
+                        if ui
+                            .button("Logs")
+                            .on_hover_text("Logs of past recordings and monitoring")
+                            .clicked()
+                        {
+                            self.open_logs(None);
+                        }
+                    });
                 });
             }
             Phase::Recording(rec) => {
                 let elapsed = rec.elapsed().as_secs();
+                let started = rec.started_at();
                 let dir = rec.dir().to_path_buf();
                 let monitor = rec.is_monitor();
                 let attention = rec
@@ -356,7 +538,9 @@ impl MultiRecorderApp {
                     .iter()
                     .filter(|(_, st)| needs_attention(st))
                     .count();
-                let (mut stop, mut open) = (false, false);
+                let (mut stop, mut open, mut show_log) = (false, false, false);
+                let mut copied = None;
+                let log_path = rec.log_path().to_path_buf();
                 ui.horizontal(|ui| {
                     let label = if monitor {
                         "■  Stop monitoring"
@@ -377,6 +561,27 @@ impl MultiRecorderApp {
                         .size(18.0)
                         .monospace(),
                     );
+                    if !monitor {
+                        let start = ui
+                            .add(
+                                egui::Label::new(format!(
+                                    "started {}",
+                                    started.format("%H:%M:%S%.3f")
+                                ))
+                                .sense(egui::Sense::click()),
+                            )
+                            .on_hover_text(
+                                "When the recording started (0:00 in every track), by this \
+                                 computer's clock. Compare it with the start time of a \
+                                 recording made on another computer to line them up. \
+                                 Click to copy.",
+                            );
+                        if start.clicked() {
+                            let text = session::format_start(&started);
+                            ui.ctx().copy_text(text.clone());
+                            copied = Some(text);
+                        }
+                    }
                     if attention > 0 {
                         ui.colored_label(
                             RED,
@@ -391,10 +596,17 @@ impl MultiRecorderApp {
                             "Open session folder"
                         };
                         open = ui.button(label).clicked();
+                        show_log = ui.button("Log").on_hover_text("Show the log").clicked();
                     });
                 });
                 if open {
                     self.open_folder(dir);
+                }
+                if show_log {
+                    self.open_logs(Some(log_path));
+                }
+                if let Some(text) = copied {
+                    self.message(format!("Copied start time: {text}"));
                 }
                 if stop {
                     self.stop_recording(&ctx);
@@ -921,6 +1133,7 @@ impl eframe::App for MultiRecorderApp {
         if self.confirm_monitor {
             self.monitor_dialog(ui.ctx());
         }
+        self.logs_window(ui.ctx());
         if self.confirm_quit {
             egui::Window::new("Still running")
                 .collapsible(false)

@@ -22,6 +22,8 @@ enum Mode {
     Flood,
     /// Glitching driver: a 20 ms gap of digital silence every 200 ms.
     Choppy,
+    /// Driver holds audio back, then delivers all of it at once (nothing lost).
+    Held,
 }
 
 #[derive(Clone)]
@@ -77,16 +79,25 @@ impl InputSource for FakeSource {
         let thread = thread::spawn(move || {
             let opened = Instant::now();
             let mut sent = 0u64;
+            let mut last_tick = 0.0;
             while !stop2.load(Ordering::Relaxed) {
                 thread::sleep(Duration::from_millis(5));
-                let due = (opened.elapsed().as_secs_f64() * f64::from(rate)) as u64;
+                let now = opened.elapsed().as_secs_f64();
+                let tick = now - last_tick;
+                last_tick = now;
+                let due = (now * f64::from(rate)) as u64;
                 match control.get() {
                     Mode::Ok => {
-                        let frames = (due - sent) as usize;
+                        // A backlog (see `Held`) drains slowly, at twice real
+                        // time, like a driver catching up bit by bit.
+                        let allowance = (2.0 * tick * f64::from(rate)) as u64;
+                        let frames = (due - sent).min(allowance.max(1));
                         sink.push(
-                            &vec![value; frames * usize::from(channels)],
+                            &vec![value; frames as usize * usize::from(channels)],
                             usize::from(channels),
                         );
+                        sent += frames;
+                        continue;
                     }
                     Mode::Flood => {
                         let frames = 50 * (due - sent) as usize;
@@ -107,6 +118,7 @@ impl InputSource for FakeSource {
                         sink.push(&frames, usize::from(channels));
                     }
                     Mode::Stalled => {}
+                    Mode::Held => continue,
                     Mode::Gone => {
                         let _ = sink.events.send(StreamEvent {
                             fatal: true,
@@ -149,6 +161,7 @@ fn test_config() -> RecorderConfig {
         flush_interval: Duration::from_millis(100),
         poll_interval: Duration::from_millis(5),
         idle_gap: Duration::from_millis(100),
+        gap_threshold: Duration::from_millis(60),
         live_export: None,
     }
 }
@@ -205,8 +218,18 @@ fn mixed_formats_stay_aligned() {
     .unwrap();
     thread::sleep(Duration::from_millis(800));
     let stopped = at(&rec);
+    let started = rec.started_at();
     let (dir, meta) = rec.stop(Duration::from_secs(5)).unwrap();
     assert_eq!(meta.state, SessionState::Stopped);
+    // The start time, to the millisecond, for lining up sessions by clock.
+    let saved = session::parse_start(&meta.started_at).unwrap();
+    assert!(
+        (started - saved).num_milliseconds().abs() < 1,
+        "{started} vs {saved}"
+    );
+    let log = std::fs::read_to_string(dir.join(session::LOG_FILE)).unwrap();
+    let line = format!("start time: {}", session::format_start(&saved));
+    assert!(log.contains(&line), "{line} not in {log}");
 
     let durations: Vec<f64> = meta
         .tracks
@@ -322,6 +345,98 @@ fn stalled_device_is_detected_and_padded() {
         gap > stalled - 0.3 && gap < stalled + 0.4,
         "stalled for {stalled:.2} s, gap {gap}"
     );
+}
+
+/// Position (s) and length (s) of the first silence after audio started, in
+/// a mono track (silence before the device connected is skipped).
+fn silence_span(samples: &[f32], rate: u32) -> (f64, f64) {
+    let audio = samples.iter().position(|&s| s != 0.0).unwrap_or(0);
+    let start = audio
+        + samples[audio..]
+            .iter()
+            .position(|&s| s == 0.0)
+            .unwrap_or(samples.len() - audio);
+    let len = samples[start..].iter().take_while(|&&s| s == 0.0).count();
+    (start as f64 / f64::from(rate), len as f64 / f64::from(rate))
+}
+
+#[test]
+fn short_delivery_gap_is_filled_and_reported() {
+    // The device stops delivering for less than the stall timeout, so the
+    // stream is kept; the audio after the gap must still land in its place.
+    let _serial = serial();
+    let root = tempfile::tempdir().unwrap();
+    let ok = Control::new(Mode::Ok);
+    let gappy = Control::new(Mode::Ok);
+    let rec = Recorder::start(
+        root.path(),
+        vec![
+            spec("ok", &ok, 48_000, 1, 0.5),
+            spec("gappy", &gappy, 48_000, 1, 0.5),
+        ],
+        test_config(),
+    )
+    .unwrap();
+    thread::sleep(Duration::from_millis(400));
+    let off = at(&rec);
+    gappy.set(Mode::Stalled);
+    thread::sleep(Duration::from_millis(180));
+    let on = at(&rec);
+    gappy.set(Mode::Ok);
+    thread::sleep(Duration::from_millis(500));
+    let statuses = rec.statuses();
+    let st = &statuses[1].1;
+    assert_eq!(st.state, TrackState::Recording);
+    assert_eq!(st.reconnects, 0, "a short gap keeps the stream");
+    assert_eq!((st.warnings.gaps, st.warnings.dropouts), (1, 1));
+    let (dir, meta) = rec.stop(Duration::from_secs(5)).unwrap();
+
+    let ok_raw = read_raw(&dir.join(&meta.tracks[0].raw_file));
+    let gap_raw = read_raw(&dir.join(&meta.tracks[1].raw_file));
+    assert_eq!(ok_raw.len(), gap_raw.len());
+    assert_eq!(statuses[0].1.warnings.gaps, 0);
+    let ok_gap = silence_span(&ok_raw, 48_000);
+    assert!(ok_gap.1 < 0.01, "silence in steady track: {ok_gap:?}");
+    let (start, len) = silence_span(&gap_raw, 48_000);
+    let paused = on - off;
+    assert!(
+        len > paused - 0.06 && len < paused + 0.03,
+        "paused {paused:.3} s, silence {len:.3} s"
+    );
+    assert!(
+        start > off - 0.05 && start < off + 0.05,
+        "paused at {off:.3} s, silence at {start:.3} s"
+    );
+    let log = std::fs::read_to_string(dir.join(session::LOG_FILE)).unwrap();
+    assert!(log.contains("gappy): device sent no audio for"), "{log}");
+    assert!(!log.contains("short gap of digital silence"), "{log}");
+}
+
+#[test]
+fn late_burst_from_driver_is_not_a_gap() {
+    // A driver that holds audio back and then delivers it all at once lost
+    // nothing; inserting silence would push the track out of sync.
+    let _serial = serial();
+    let root = tempfile::tempdir().unwrap();
+    let held = Control::new(Mode::Ok);
+    let rec = Recorder::start(
+        root.path(),
+        vec![spec("held", &held, 48_000, 1, 0.5)],
+        test_config(),
+    )
+    .unwrap();
+    thread::sleep(Duration::from_millis(400));
+    held.set(Mode::Held);
+    thread::sleep(Duration::from_millis(200));
+    held.set(Mode::Ok);
+    thread::sleep(Duration::from_millis(400));
+    let st = rec.statuses()[0].1.clone();
+    assert_eq!(st.warnings.gaps, 0);
+    let (dir, meta) = rec.stop(Duration::from_secs(5)).unwrap();
+    let raw = read_raw(&dir.join(&meta.tracks[0].raw_file));
+    // Silence before the device connected doesn't count.
+    let span = silence_span(&raw, 48_000);
+    assert!(span.1 < 0.02, "silence inserted: {span:?}");
 }
 
 #[test]
@@ -467,13 +582,28 @@ fn choppy_device_raises_warning_and_meters_move() {
         test_config(),
     )
     .unwrap();
+    // About 7 dropouts in 1.5 s; a busy CI machine may deliver them later.
     thread::sleep(Duration::from_millis(1500));
-    let statuses = rec.statuses();
+    let deadline = Instant::now() + Duration::from_secs(4);
+    let statuses = loop {
+        let statuses = rec.statuses();
+        let w = &statuses[1].1.warnings;
+        if (w.choppy && w.dropouts >= 4) || Instant::now() > deadline {
+            break statuses;
+        }
+        thread::sleep(Duration::from_millis(50));
+    };
     let (ok_st, choppy_st) = (&statuses[0].1, &statuses[1].1);
     assert!(!ok_st.warnings.any_problem(), "{:?}", ok_st.warnings);
     assert!(ok_st.levels.iter().all(|&l| l > 0.3), "{:?}", ok_st.levels);
-    assert!(choppy_st.warnings.choppy, "{:?}", choppy_st.warnings);
-    assert!(choppy_st.warnings.dropouts >= 4);
+    let seen = format!(
+        "{:?} after {:.2} s, {:.2} s written",
+        choppy_st.warnings,
+        at(&rec),
+        choppy_st.frames_written as f64 / 48_000.0
+    );
+    assert!(choppy_st.warnings.choppy, "{seen}");
+    assert!(choppy_st.warnings.dropouts >= 4, "{seen}");
     let (dir, _) = rec.stop(Duration::from_secs(5)).unwrap();
     let log = std::fs::read_to_string(dir.join(session::LOG_FILE)).unwrap();
     assert!(log.contains("(choppy): WARNING choppy audio"), "{log}");

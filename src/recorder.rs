@@ -42,6 +42,10 @@ pub struct RecorderConfig {
     /// Loopback sources send nothing while nothing plays; after this long
     /// without data their track is filled with silence up to real time.
     pub idle_gap: Duration,
+    /// A running stream that delivers nothing for at least this long (but
+    /// less than `stall_timeout`) has a gap: it is logged and filled with
+    /// silence, so later audio stays in sync.
+    pub gap_threshold: Duration,
     /// Export to this format alongside the recording, so stopping is quick.
     pub live_export: Option<ExportFormat>,
 }
@@ -55,6 +59,7 @@ impl Default for RecorderConfig {
             flush_interval: Duration::from_secs(1),
             poll_interval: Duration::from_millis(15),
             idle_gap: Duration::from_millis(100),
+            gap_threshold: Duration::from_millis(100),
             live_export: None,
         }
     }
@@ -133,6 +138,8 @@ pub struct Recorder {
     meta: Option<SessionMeta>,
     log_path: PathBuf,
     start: Instant,
+    /// Wall-clock time of `start`.
+    started: chrono::DateTime<chrono::Local>,
     stop_at: Arc<OnceLock<Instant>>,
     tracks: Vec<Track>,
     log: Arc<SessionLog>,
@@ -147,8 +154,7 @@ impl Recorder {
         let log = Arc::new(SessionLog::open_file(&log_path));
 
         let metas = track_metas(&specs, |i, s| session::raw_file_name(i, &s.device_name));
-        let meta = SessionMeta::new(metas.clone());
-        meta.save(&dir)?;
+        let mut meta = SessionMeta::new(metas.clone());
 
         let files = metas
             .iter()
@@ -161,12 +167,23 @@ impl Recorder {
             .collect::<Result<Vec<_>>>()?;
         session::sync_dir(&dir);
 
+        // Position 0 of every track is this moment. Wall clock and timeline
+        // are read together so the logged start time matches the audio.
+        let start = Instant::now();
+        let started = chrono::Local::now();
+        meta.started_at = started.to_rfc3339_opts(chrono::SecondsFormat::Millis, false);
+        meta.save(&dir)?;
         log.line(&format!("recording started in {}", dir.display()));
+        log.line(&format!(
+            "start time: {} = 0:00 in every track (this computer's clock)",
+            session::format_start(&started)
+        ));
         let mut rec = Self {
             dir,
             meta: Some(meta),
             log_path,
-            start: Instant::now(),
+            start,
+            started,
             stop_at: Arc::new(OnceLock::new()),
             tracks: Vec::new(),
             log,
@@ -195,6 +212,7 @@ impl Recorder {
             meta: None,
             log_path,
             start: Instant::now(),
+            started: chrono::Local::now(),
             stop_at: Arc::new(OnceLock::new()),
             tracks: Vec::new(),
             log,
@@ -282,6 +300,12 @@ impl Recorder {
     /// Log lines written since the previous call, for display.
     pub fn take_events(&self) -> Vec<String> {
         self.log.take_new()
+    }
+
+    /// When the shared timeline started (0:00 in every track), by this
+    /// computer's clock.
+    pub fn started_at(&self) -> chrono::DateTime<chrono::Local> {
+        self.started
     }
 
     pub fn dir(&self) -> &Path {
@@ -502,6 +526,117 @@ impl RawWriter {
     }
 }
 
+/// Delivery gaps filled since the last log line.
+#[derive(Default)]
+struct GapLog {
+    count: u64,
+    frames: u64,
+    /// All gap frames filled so far (part of the track's inserted silence).
+    total_frames: u64,
+}
+
+enum GapCheck {
+    /// No gap: write the audio.
+    Drain,
+    /// Possible gap: keep the audio in the ring a little longer.
+    Hold,
+    /// Gap confirmed: insert this many frames of silence, then the audio.
+    Fill(u64),
+}
+
+/// Notices when a running stream delivered nothing for a moment, and how
+/// much silence puts the audio after it back in its place on the timeline.
+///
+/// The lag (timeline position minus frames received) stays steady while a
+/// device delivers in real time; it only wobbles by a buffer period or so.
+/// A pause in delivery shows up as a jump in lag by the pause's length when
+/// audio arrives again. Drivers often deliver delayed audio late, quickly or
+/// slowly; while they catch up the jump keeps shrinking. So a jump only
+/// counts once it has stopped shrinking for `confirm` (or after `max_hold`,
+/// well within the ring buffer). The baseline follows slow clock drift: it
+/// rises with the lag at once and sinks slowly, which also forgets startup
+/// latency.
+struct GapDetector {
+    threshold: f64,
+    confirm: Duration,
+    max_hold: Duration,
+    /// How much the jump must shrink to count as catching up (jitter margin).
+    tolerance: f64,
+    /// Frames per second the baseline may sink.
+    sink_rate: f64,
+    base: Option<f64>,
+    last: Instant,
+    suspect: Option<Suspect>,
+}
+
+/// A jump in lag being watched.
+struct Suspect {
+    first: Instant,
+    /// When the jump last shrank, and to what.
+    shrank: Instant,
+    smallest: f64,
+}
+
+impl GapDetector {
+    fn new(threshold: Duration, sample_rate: u32) -> Self {
+        let rate = f64::from(sample_rate);
+        Self {
+            threshold: threshold.as_secs_f64() * rate,
+            confirm: threshold,
+            max_hold: Duration::from_secs(1),
+            tolerance: threshold.as_secs_f64() * rate / 2.0,
+            sink_rate: 0.01 * rate,
+            base: None,
+            last: Instant::now(),
+            suspect: None,
+        }
+    }
+
+    /// For a new stream, whose latency may differ.
+    fn reset(&mut self) {
+        self.base = None;
+        self.suspect = None;
+    }
+
+    /// `lag` is measured when audio is waiting to be written. `force` decides
+    /// without waiting (the stream has ended, so no catch-up can follow).
+    fn check(&mut self, now: Instant, lag: i64, force: bool) -> GapCheck {
+        let lag = lag as f64;
+        let elapsed = now.saturating_duration_since(self.last).as_secs_f64();
+        self.last = now;
+        let Some(base) = self.base else {
+            self.base = Some(lag);
+            return GapCheck::Drain;
+        };
+        let base = base - self.sink_rate * elapsed;
+        self.base = Some(base);
+        let excess = lag - base;
+        if excess < self.threshold {
+            self.suspect = None;
+            self.base = Some(base.max(lag));
+            return GapCheck::Drain;
+        }
+        let s = self.suspect.get_or_insert(Suspect {
+            first: now,
+            shrank: now,
+            smallest: excess,
+        });
+        if excess < s.smallest - self.tolerance {
+            s.smallest = excess;
+            s.shrank = now;
+        }
+        if force
+            || now.duration_since(s.shrank) >= self.confirm
+            || now.duration_since(s.first) >= self.max_hold
+        {
+            self.suspect = None;
+            GapCheck::Fill(excess.round() as u64)
+        } else {
+            GapCheck::Hold
+        }
+    }
+}
+
 struct OpenStream {
     _stream: ActiveStream,
     consumer: rtrb::Consumer<f32>,
@@ -572,8 +707,25 @@ impl TrackWorker {
 
     /// Logs dropouts and clipping since the last report, at most once a
     /// second, so a single short cutout is on record without flooding the log.
-    fn log_new_events(&self, reported: &mut Warnings, now: &Warnings) {
-        let dropouts = now.dropouts - reported.dropouts;
+    fn log_new_events(&self, reported: &mut Warnings, now: &Warnings, gaps: &mut GapLog) {
+        if gaps.count > 0 {
+            let ms = gaps.frames * 1000 / u64::from(self.sample_rate);
+            let what = if gaps.count == 1 {
+                format!("device sent no audio for {ms} ms")
+            } else {
+                format!(
+                    "device sent no audio {} times, {ms} ms in total",
+                    gaps.count
+                )
+            };
+            self.log.line(&format!(
+                "{}: {what}; filled with silence to stay in sync ({} so far)",
+                self.name, now.gaps
+            ));
+            gaps.count = 0;
+            gaps.frames = 0;
+        }
+        let dropouts = (now.dropouts - now.gaps) - (reported.dropouts - reported.gaps);
         if dropouts > 0 {
             self.log.line(&format!(
                 "{}: {dropouts} dropout(s): short gap of digital silence ({} so far)",
@@ -588,6 +740,44 @@ impl TrackWorker {
             ));
         }
         reported.clone_from(now);
+    }
+
+    /// Checks a running stream for a delivery gap (see [`GapDetector`]) and
+    /// fills one with silence before the audio after it is written. Returns
+    /// true while audio should stay in the ring until the gap is confirmed.
+    /// `force` decides at once, for a stream that has delivered its last audio.
+    #[allow(clippy::too_many_arguments)]
+    fn check_gap(
+        &mut self,
+        gaps: &mut GapDetector,
+        now: Instant,
+        consumer: &rtrb::Consumer<f32>,
+        dropped: &AtomicU64,
+        analyzer: &mut Analyzer,
+        force: bool,
+        log: &mut GapLog,
+    ) -> std::io::Result<bool> {
+        let channels = u64::from(self.channels);
+        // `now` was taken before the ring is inspected, so audio landing in
+        // between can only make the lag look smaller, never invent a gap.
+        let pending = consumer.slots() as u64 / channels;
+        if pending == 0 {
+            return Ok(false);
+        }
+        let received = self.writer.frames() + pending + dropped.load(Ordering::Relaxed) / channels;
+        let lag = self.timeline_frames(now) as i64 - received as i64;
+        match gaps.check(now, lag, force) {
+            GapCheck::Drain => Ok(false),
+            GapCheck::Hold => Ok(true),
+            GapCheck::Fill(frames) => {
+                self.writer.write_silence(frames)?;
+                analyzer.delivery_gap();
+                log.count += 1;
+                log.frames += frames;
+                log.total_frames += frames;
+                Ok(false)
+            }
+        }
     }
 
     fn set_state(&self, state: TrackState) {
@@ -618,6 +808,8 @@ impl TrackWorker {
         let mut warnings = Warnings::default();
         let mut reported = Warnings::default();
         let mut last_events = Instant::now();
+        let mut gaps = GapDetector::new(self.config.gap_threshold, self.sample_rate);
+        let mut gap_log = GapLog::default();
         let mut levels = vec![0.0f32; usize::from(self.channels)];
         let mut last_meter = Instant::now();
         let mut history = LevelHistory::new(last_meter);
@@ -659,6 +851,7 @@ impl TrackWorker {
                         ever_connected = true;
                         last_error.clear();
                         analyzer.stream_restarted();
+                        gaps.reset();
                         stream = Some(OpenStream {
                             _stream: s,
                             consumer,
@@ -682,12 +875,28 @@ impl TrackWorker {
 
             let limit = self.timeline_frames(now) + max_ahead;
             if let Some(s) = stream.as_mut() {
-                let (read, discarded) =
-                    drain(&mut s.consumer, &mut self.writer, &mut analyzer, limit)?;
-                if read > 0 {
+                let hold = !self.loopback
+                    && self.check_gap(
+                        &mut gaps,
+                        now,
+                        &s.consumer,
+                        &dropped,
+                        &mut analyzer,
+                        false,
+                        &mut gap_log,
+                    )?;
+                if hold {
+                    // Audio arrived after a pause; wait briefly in case the
+                    // driver is still catching up before deciding on a gap.
                     s.last_data = now;
+                } else {
+                    let (read, discarded) =
+                        drain(&mut s.consumer, &mut self.writer, &mut analyzer, limit)?;
+                    if read > 0 {
+                        s.last_data = now;
+                    }
+                    discard_pending += discarded;
                 }
-                discard_pending += discarded;
             }
             let lost = dropped.swap(0, Ordering::Relaxed) / u64::from(self.channels);
             if lost > 0 {
@@ -735,6 +944,17 @@ impl TrackWorker {
                 if let Some(msg) = failure {
                     let mut dead = stream.take().expect("stream present");
                     drop(dead._stream);
+                    if !self.loopback {
+                        self.check_gap(
+                            &mut gaps,
+                            now,
+                            &dead.consumer,
+                            &dropped,
+                            &mut analyzer,
+                            true,
+                            &mut gap_log,
+                        )?;
+                    }
                     drain(&mut dead.consumer, &mut self.writer, &mut analyzer, limit)?;
                     self.log.line(&format!("{}: lost device: {msg}", self.name));
                     self.set_state(TrackState::Reconnecting(msg.clone()));
@@ -767,9 +987,20 @@ impl TrackWorker {
             if let Some(t) = stop_at {
                 if let Some(mut s) = stream.take() {
                     drop(s._stream);
+                    if !self.loopback {
+                        self.check_gap(
+                            &mut gaps,
+                            now,
+                            &s.consumer,
+                            &dropped,
+                            &mut analyzer,
+                            true,
+                            &mut gap_log,
+                        )?;
+                    }
                     drain(&mut s.consumer, &mut self.writer, &mut analyzer, limit)?;
                 }
-                self.log_new_events(&mut reported, &analyzer.warnings());
+                self.log_new_events(&mut reported, &analyzer.warnings(), &mut gap_log);
                 let end = self.timeline_frames(t);
                 silence += self.writer.pad_to(end)?;
                 self.writer.truncate_to(end)?;
@@ -780,7 +1011,7 @@ impl TrackWorker {
                 let mut st = self.status.lock().expect("status lock");
                 st.state = TrackState::Stopped;
                 st.frames_written = self.writer.frames();
-                st.silence_frames = silence;
+                st.silence_frames = silence + gap_log.total_frames;
                 return Ok(());
             }
 
@@ -805,14 +1036,14 @@ impl TrackWorker {
             let current = analyzer.warnings();
             self.log_warning_changes(&warnings, &current);
             if now.duration_since(last_events) >= Duration::from_secs(1) {
-                self.log_new_events(&mut reported, &current);
+                self.log_new_events(&mut reported, &current, &mut gap_log);
                 last_events = now;
             }
             warnings = current;
             {
                 let mut st = self.status.lock().expect("status lock");
                 st.frames_written = self.writer.frames();
-                st.silence_frames = silence;
+                st.silence_frames = silence + gap_log.total_frames;
                 st.levels.clone_from(&levels);
                 if history_changed {
                     st.history.clear();

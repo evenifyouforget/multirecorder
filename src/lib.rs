@@ -4,6 +4,7 @@ pub mod analysis;
 pub mod app;
 pub mod audio;
 pub mod export;
+pub mod logs;
 pub mod recorder;
 pub mod resources;
 pub mod session;

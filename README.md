@@ -49,11 +49,37 @@ the output folder (a few KB; no audio). It sees what the device delivers to the
 computer, so problems later in the chain (e.g. in OBS's encoder or upload)
 won't show up.
 
+### Logs
+
+**Logs** (top right) lists the logs of past recordings and monitoring in the
+output folder, newest first, and shows the selected one; the current session's
+log follows along while it runs (**Log** button). Text can be selected and
+copied, or copied whole with **Copy all**.
+
+### Lining up recordings from several computers
+
+Every recording notes when it started, to the millisecond. 0:00 in every track
+is that moment. While recording, the time is shown next to the timer (click it
+to copy). Afterwards it is in the session's log (**Logs** button) and in
+`session.json`, e.g.
+
+```text
+start time: 2026-11-11 14:03:22.517 +01:00 (13:03:22.517 UTC) = 0:00 in every track
+```
+
+When friends each record their own side of a call, the difference between two
+start times is the offset between their recordings: if yours started at
+`13:03:22.517 UTC` and theirs at `13:03:25.017 UTC`, their 0:00 is at 2.5 s in
+yours. This is only as accurate as the two computers' clocks. On Windows, press
+**Sync now** under Settings → Time & language → Date & time before recording.
+Even synced clocks can differ by tens to hundreds of milliseconds, so for an
+exact match, clap once while everyone is recording and line up the claps.
+
 ### Warnings
 
 | Warning | Meaning |
 |---|---|
-| ⚠ choppy | Repeated short gaps of digital silence (3+ within 3 s): usually a driver, USB or buffer problem. |
+| ⚠ choppy | Repeated dropouts (3+ within 3 s): short gaps of digital silence, or moments where the device sent no audio at all. Usually a driver, USB or buffer problem. |
 | ⚠ clipping | The signal hits full scale and is distorted; lower the input gain. |
 | no signal | Nothing above -80 dBFS for 5 s. Fine if the source is meant to be silent. |
 | reconnecting | The device is missing; its track is being filled with silence. |
@@ -72,6 +98,9 @@ keep up and gaps are likely.
 - All tracks share one timeline. If a device disconnects, stalls, or can't keep
   up, its track is filled with silence, and it is reopened automatically when it
   comes back. Tracks always line up and end with equal length.
+- A device that stops sending audio for a moment (0.1 to 2 s) keeps its
+  stream; the gap is logged and filled with silence so the audio after it stays
+  in sync. Audio a driver merely delivers late, in a burst, is not a gap.
 - Audio is captured to headerless raw files (`*.f32`) flushed to disk every
   second, so a crash loses at most about a second. Interrupted sessions are
   listed at startup and can be exported from there.
