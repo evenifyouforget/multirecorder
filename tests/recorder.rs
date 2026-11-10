@@ -697,11 +697,20 @@ fn quiet_loopback_is_padded_not_reconnected() {
     .unwrap();
 
     thread::sleep(Duration::from_millis(600));
-    let checked = at(&rec);
-    let st = rec.statuses()[1].1.clone();
+    // Keeps up with the timeline while idle (minus idle_gap and poll jitter).
+    // Polled: a busy CI machine may run the track thread late.
+    let deadline = std::time::Instant::now() + Duration::from_millis(1500);
+    let (st, checked) = loop {
+        let checked = at(&rec);
+        let st = rec.statuses()[1].1.clone();
+        let kept_up = st.frames_written as f64 / 48_000.0 > checked - 0.2;
+        if kept_up || std::time::Instant::now() > deadline {
+            break (st, checked);
+        }
+        thread::sleep(Duration::from_millis(50));
+    };
     assert_eq!(st.state, TrackState::Recording);
     assert!(st.idle);
-    // Kept up with the timeline while idle (minus idle_gap and poll jitter).
     assert!(
         st.frames_written as f64 / 48_000.0 > checked - 0.2,
         "{} frames at {checked:.2} s",

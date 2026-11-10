@@ -59,6 +59,11 @@ fn wait_for(
     }
 }
 
+/// The session log so far, for failure messages.
+fn log_of(rec: &Recorder) -> String {
+    std::fs::read_to_string(rec.dir().join(session::LOG_FILE)).unwrap_or_default()
+}
+
 fn audio_seconds(path: &Path) -> f64 {
     let bytes = std::fs::read(path).unwrap();
     let audio = bytes
@@ -93,13 +98,23 @@ fn crashing_or_hung_helper_only_affects_its_track() {
     let st = wait_for(&rec, 1, 6.0, |s| {
         s.state == TrackState::Recording && s.reconnects >= 1
     });
-    assert_eq!((st.state, st.reconnects), (TrackState::Recording, 1));
+    assert_eq!(
+        (st.state, st.reconnects),
+        (TrackState::Recording, 1),
+        "{}",
+        log_of(&rec)
+    );
     thread::sleep(Duration::from_millis(300));
     set(&flaky, "hang");
     let st = wait_for(&rec, 1, 10.0, |s| {
         s.state == TrackState::Recording && s.reconnects >= 2
     });
-    assert_eq!((st.state, st.reconnects), (TrackState::Recording, 2));
+    assert_eq!(
+        (st.state, st.reconnects),
+        (TrackState::Recording, 2),
+        "{}",
+        log_of(&rec)
+    );
     thread::sleep(Duration::from_millis(500));
 
     let steady_st = rec.statuses()[0].1.clone();
