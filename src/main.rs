@@ -20,6 +20,11 @@ fn run(renderer: Renderer) -> eframe::Result {
 }
 
 fn main() -> eframe::Result {
+    // The same executable doubles as the app-capture helper process.
+    let args: Vec<String> = std::env::args().collect();
+    if let Some(code) = multirecorder::apps::run_helper(&args) {
+        std::process::exit(code);
+    }
     env_logger::init();
     // wgpu (DX12/Vulkan/Metal) is preferred; OpenGL covers machines where it fails to start.
     run(Renderer::Wgpu).or_else(|e| {

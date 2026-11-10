@@ -28,3 +28,18 @@ tempfile = "3.27.0"
 [profile.release]
 strip = true
 lto = "thin"
+
+# Recording individual apps (process loopback); used only by the helper process.
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.62.2", features = [
+    "Win32_Foundation",
+    "Win32_Media_Audio",
+    "Win32_Security",
+    "Win32_System_Com",
+    "Win32_System_Com_StructuredStorage",
+    "Win32_System_Diagnostics_ToolHelp",
+    "Win32_System_Threading",
+    "Win32_System_Variant",
+] }
+# `#[implement]` (a COM callback object) refers to this crate by name.
+windows-core = "0.62.2"

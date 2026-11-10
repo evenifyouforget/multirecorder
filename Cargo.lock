@@ -2334,6 +2334,8 @@ dependencies = [
  "serde",
  "serde_json",
  "tempfile",
+ "windows",
+ "windows-core",
 ]
 
 [[package]]

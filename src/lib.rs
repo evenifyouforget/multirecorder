@@ -2,6 +2,7 @@
 
 pub mod analysis;
 pub mod app;
+pub mod apps;
 pub mod audio;
 pub mod export;
 pub mod logs;
